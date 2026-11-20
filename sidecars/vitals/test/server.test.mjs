@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { StandaloneSidecarApp, registerRoutes } from '../main.mjs';
+import { FallbackResponse, StandaloneSidecarApp, registerRoutes } from '../main.mjs';
 import { createVitalsService } from '../lib/vitals-service.mjs';
 import {
   encodeDuration,
@@ -63,15 +63,7 @@ describe('vitals sidecar HTTP API', () => {
     const app = new StandaloneSidecarApp();
     const service = createVitalsService({ getAppDataDirs: () => [appData] });
 
-    class TestResp {
-      constructor(body, opts = {}) {
-        this.body = body;
-        this.status = opts.status || 200;
-        this.contentType = opts.contentType || 'text/plain';
-        this.headers = opts.headers || {};
-      }
-    }
-    registerRoutes(app, TestResp, service);
+    registerRoutes(app, FallbackResponse, service);
 
     try {
       const healthRes = await app.dispatch('GET', '/api/health');
@@ -106,9 +98,21 @@ describe('vitals sidecar HTTP API', () => {
       const missing = JSON.parse(missingRes.body);
       assert.equal(missing.hasData, false);
 
-      // Standalone /preload.js stub responds 200
+      // Standalone /preload.js stub and static frontend assets respond 200
       const preloadRes = await app.dispatch('GET', '/preload.js');
       assert.equal(preloadRes.status, 200);
+
+      const indexRes = await app.dispatch('GET', '/');
+      assert.equal(indexRes.status, 200);
+      assert.match(indexRes.body, /<script src="\/preload\.js"><\/script>/);
+
+      const cssRes = await app.dispatch('GET', '/styles.css');
+      assert.equal(cssRes.status, 200);
+      assert.match(cssRes.headers['Content-Type'], /text\/css/);
+
+      const jsRes = await app.dispatch('GET', '/app.js');
+      assert.equal(jsRes.status, 200);
+      assert.match(jsRes.headers['Content-Type'], /javascript/);
 
       // Unknown route returns 404
       const notFoundRes = await app.dispatch('GET', '/nonexistent');

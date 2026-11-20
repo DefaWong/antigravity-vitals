@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Vitals — Antigravity Telemetry</title>
+  <script src="/preload.js"></script>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div id="app" class="shell">
+    <!-- Sticky Header -->
+    <header class="header">
+      <div class="header-top">
+        <div class="model-wrap">
+          <span id="liveDot" class="live-dot dot-ok" aria-hidden="true"></span>
+          <span id="modelLabel" class="model-label" title="当前会话模型">等待会话数据…</span>
+        </div>
+        <div class="header-controls">
+          <span id="sourceBadge" class="badge mono" title="遥测数据源">SQLite</span>
+          <button
+            id="tpsModeBtn"
+            type="button"
+            class="btn-pill mono"
+            title="点击切换纯解码 TPS (Decode) 与端到端 TPS (E2E)"
+          >Decode</button>
+        </div>
+      </div>
+
+      <nav class="tabs" role="tablist" aria-label="遥测视图">
+        <button type="button" role="tab" data-tab="overview" aria-selected="true" class="tab active">总览</button>
+        <button type="button" role="tab" data-tab="turns" aria-selected="false" class="tab">
+          轮次 <span id="turnsCountBadge" class="mono tab-count">0</span>
+        </button>
+        <button type="button" role="tab" data-tab="breakdown" aria-selected="false" class="tab">上下文拆解</button>
+      </nav>
+    </header>
+
+    <!-- Scrollable Body -->
+    <main class="main">
+      <!-- Empty / Waiting State -->
+      <section id="emptyState" class="empty-state">
+        <div class="empty-card">
+          <svg class="empty-icon" viewBox="0 0 48 48" width="40" height="40" aria-hidden="true">
+            <rect x="6" y="6" width="36" height="36" rx="10" fill="none" stroke="currentColor" stroke-width="2" opacity="0.35" />
+            <path d="M12 25h6l4-10 5 18 4-11 3 3h4" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" />
+          </svg>
+          <h2 id="emptyTitle" class="empty-title">等待当前会话遥测数据</h2>
+          <p id="emptyDesc" class="empty-desc">发起对话后将自动读取本地 SQLite gen_metadata，实时展示纯解码 TPS、TTFT、缓存命中率与上下文拆解。</p>
+          <div class="empty-hint">
+            <span class="live-dot dot-live" aria-hidden="true"></span>
+            <span id="emptyHintText">正在监听当前会话…</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- Active Telemetry Content -->
+      <div id="content" class="content hidden">
+        <!-- Conditional Alert Banner -->
+        <div id="alertBanner" class="alert-banner hidden" role="alert">
+          <span id="alertIcon" class="alert-icon" aria-hidden="true">!</span>
+          <div class="alert-body">
+            <div id="alertTitle" class="alert-title"></div>
+            <div id="alertDesc" class="alert-desc"></div>
+          </div>
+        </div>
+
+        <!-- ==================== TAB 1: OVERVIEW ==================== -->
+        <section id="panel-overview" class="tab-panel" role="tabpanel">
+          <!-- 2x2 Bento KPI Grid -->
+          <div class="kpi-grid">
+            <!-- KPI 1: TPS & TTFT -->
+            <div class="card kpi-card">
+              <div class="kpi-head">
+                <span id="tpsTitle">纯解码 TPS</span>
+                <span id="tpsStateTag" class="mono tag-ok">暖缓存</span>
+              </div>
+              <div class="kpi-value-row">
+                <span id="kpiTps" class="kpi-value mono">--</span>
+                <span class="kpi-unit mono">tok/s</span>
+              </div>
+              <div class="kpi-foot mono">
+                <span>TTFT <strong id="kpiTtft">--</strong></span>
+                <span>均 <span id="kpiAvgTps">--</span></span>
+              </div>
+            </div>
+
+            <!-- KPI 2: Cache Hit Rate -->
+            <div class="card kpi-card">
+              <div class="kpi-head">
+                <span>缓存命中率</span>
+                <span id="cacheTrend" class="mono tag-ok">本轮 --</span>
+              </div>
+              <div class="kpi-value-row">
+                <span id="kpiCache" class="kpi-value mono">--</span>
+              </div>
+              <div class="kpi-foot mono">
+                <span>已命中 <strong id="kpiCacheSaved">--</strong></span>
+                <span id="kpiCacheCold">冷启 0</span>
+              </div>
+            </div>
+
+            <!-- KPI 3: Context Utilization -->
+            <div class="card kpi-card">
+              <div class="kpi-head">
+                <span>上下文利用</span>
+                <button
+                  id="limitCycleBtn"
+                  type="button"
+                  class="mini-btn mono"
+                  title="点击切换上下文窗口上限（自动检测 / 200k / 256k / 512k / 1M）"
+                >512k</button>
+              </div>
+              <div class="kpi-value-row">
+                <span id="kpiCtxPct" class="kpi-value mono">--</span>
+              </div>
+              <div class="kpi-foot mono">
+                <span id="kpiCtxUsed">-- 已用</span>
+                <span id="kpiCtxLeft">余 --</span>
+              </div>
+            </div>
+
+            <!-- KPI 4: Session Tokens -->
+            <div class="card kpi-card">
+              <div class="kpi-head">
+                <span>会话 Tokens</span>
+                <span id="kpiCalls" class="mono">0 次</span>
+              </div>
+              <div class="kpi-value-row">
+                <span id="kpiTotalTok" class="kpi-value mono">--</span>
+              </div>
+              <div class="kpi-foot mono">
+                <span>入 <strong id="kpiInTok">--</strong></span>
+                <span>出 <strong id="kpiOutTok">--</strong></span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Context Window Segmented Bar Card -->
+          <div class="card section-card">
+            <div class="card-head">
+              <span class="card-title">当前窗口构成</span>
+              <span id="ctxBarSummary" class="mono muted">-- / --</span>
+            </div>
+            <div class="stacked-bar" aria-label="上下文窗口占用条">
+              <div id="segCache" class="seg" style="background: var(--v-chart-1); width: 0%;"></div>
+              <div id="segUncached" class="seg" style="background: var(--v-chart-2); width: 0%;"></div>
+              <div id="segThinking" class="seg" style="background: var(--v-chart-3); width: 0%;"></div>
+              <div id="segReply" class="seg" style="background: var(--v-chart-4); width: 0%;"></div>
+              <div class="threshold-line" title="80% 建议压缩线"></div>
+            </div>
+            <div class="legend-grid">
+              <div class="legend-item">
+                <span class="legend-label"><span class="swatch" style="background: var(--v-chart-1);"></span>缓存 Prompt</span>
+                <span id="legCache" class="mono strong">0</span>
+              </div>
+              <div class="legend-item">
+                <span class="legend-label"><span class="swatch" style="background: var(--v-chart-2);"></span>新增 Input</span>
+                <span id="legUncached" class="mono strong">0</span>
+              </div>
+              <div class="legend-item">
+                <span class="legend-label"><span class="swatch" style="background: var(--v-chart-3);"></span>Thinking</span>
+                <span id="legThinking" class="mono strong">0</span>
+              </div>
+              <div class="legend-item">
+                <span class="legend-label"><span class="swatch" style="background: var(--v-chart-4);"></span>Reply &amp; Tools</span>
+                <span id="legReply" class="mono strong">0</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Interactive Trend Chart Card -->
+          <div class="card section-card">
+            <div class="card-head">
+              <span id="chartTitle" class="card-title">最近 12 轮趋势</span>
+              <div class="segmented" role="group" aria-label="图表模式">
+                <button type="button" data-chart="tps" class="seg-btn active">TPS / TTFT</button>
+                <button type="button" data-chart="cache" class="seg-btn">缓存命中</button>
+              </div>
+            </div>
+            <div class="inspector mono">
+              <span class="muted">悬停查看单轮详情</span>
+              <span id="chartInspectorVal" class="strong">--</span>
+            </div>
+            <div id="svgChartWrap" class="chart-wrap"></div>
+          </div>
+
+          <!-- Latest Turn Strip -->
+          <div class="card strip-card">
+            <div class="strip-left">
+              <span class="muted">最近调用</span>
+              <span id="lastTurnMeta" class="mono strong truncate">--</span>
+            </div>
+            <button id="jumpTurnsBtn" type="button" class="link-btn">明细 →</button>
+          </div>
+        </section>
+
+        <!-- ==================== TAB 2: TURNS LEDGER ==================== -->
+        <section id="panel-turns" class="tab-panel hidden" role="tabpanel">
+          <div class="turns-toolbar">
+            <div class="filter-group" id="turnFilterBar">
+              <button type="button" data-filter="all" class="filter-btn active">全部</button>
+              <button type="button" data-filter="cold" class="filter-btn">缓存异常</button>
+              <button type="button" data-filter="tool" class="filter-btn">工具调用</button>
+            </div>
+            <span class="muted">点击展开明细</span>
+          </div>
+          <div id="turnsList" class="turns-list"></div>
+        </section>
+
+        <!-- ==================== TAB 3: CONTEXT BREAKDOWN ==================== -->
+        <section id="panel-breakdown" class="tab-panel hidden" role="tabpanel">
+          <!-- 100-Cell Matrix -->
+          <div class="card section-card">
+            <div class="card-head">
+              <span class="card-title">100 格上下文占比图</span>
+              <span class="mono muted">1 格 = 1%</span>
+            </div>
+            <div id="ctxGrid" class="ctx-grid" aria-label="100 格上下文矩阵"></div>
+            <div class="grid-foot mono">
+              <span id="gridHoverText" class="muted truncate">悬停格子查看成分</span>
+              <span class="grid-foot-nums">
+                <span>已用 <strong id="gridUsedPct">0%</strong></span>
+                <span>余 <strong id="gridFreePct">100%</strong></span>
+              </span>
+            </div>
+          </div>
+
+          <!-- Category Breakdown Rows -->
+          <div class="card section-card">
+            <div class="card-head">
+              <span class="card-title">Token 成分明细</span>
+              <span id="breakdownModeTag" class="mono muted">SQLite 实测</span>
+            </div>
+            <div id="categoryRows" class="cat-list"></div>
+          </div>
+
+          <!-- Warm vs Cold TTFT Comparison -->
+          <div class="card section-card">
+            <div class="card-head">
+              <span class="card-title">缓存对 TTFT 加速效果</span>
+              <span id="speedupBadge" class="speedup-badge mono">--</span>
+            </div>
+            <div class="ttft-compare">
+              <div class="ttft-row">
+                <div class="ttft-meta mono">
+                  <span class="muted">缓存命中均值 <span id="warmCountLabel">(0)</span></span>
+                  <span id="warmTtftVal" class="strong">--</span>
+                </div>
+                <div class="bar-track">
+                  <div id="warmTtftBar" class="bar-fill" style="background: var(--v-success); width: 0%;"></div>
+                </div>
+              </div>
+              <div class="ttft-row">
+                <div class="ttft-meta mono">
+                  <span class="muted">冷预填充均值 <span id="coldCountLabel">(0)</span></span>
+                  <span id="coldTtftVal" class="strong">--</span>
+                </div>
+                <div class="bar-track">
+                  <div id="coldTtftBar" class="bar-fill" style="background: var(--v-warning); width: 0%;"></div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+      </div>
+    </main>
+
+    <!-- Sticky Micro Footer -->
+    <footer class="footer mono">
+      <span id="footerConv" class="truncate">conv: --</span>
+      <span id="footerSync" class="footer-sync">初始化…</span>
+    </footer>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

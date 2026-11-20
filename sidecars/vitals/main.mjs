@@ -19,7 +19,7 @@ const STATIC_ASSETS = {
   '/app.js': ['app.js', 'application/javascript; charset=utf-8'],
 };
 
-class FallbackResponse {
+export class FallbackResponse {
   constructor(body, opts = {}) {
     this.body = body;
     this.status = opts.status || 200;
