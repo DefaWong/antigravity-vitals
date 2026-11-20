@@ -8,6 +8,7 @@
  *   turns ledger, and 100-cell matrix when `historyRev` is unchanged.
  * - On-demand 100ms clock ticker: only active while pane is visible & model
  *   or tools are actively running.
+ * - Automatic bilingual UI (zh / en) via `window.VitalsI18n`.
  */
 (() => {
   const ACTIVE_POLL_MS = 350;
@@ -15,6 +16,9 @@
   const EMPTY_POLL_MS = 1500;
   const LIVE_TICK_MS = 100;
   const LIMIT_PRESETS = [0, 200000, 256000, 512000, 1000000]; // 0 = auto-detected
+
+  const i18n = window.VitalsI18n;
+  const t = (key, vars) => (i18n ? i18n.t(key, vars) : key);
 
   const $ = (id) => document.getElementById(id);
   const params = new URLSearchParams(location.search);
@@ -203,6 +207,58 @@
     return 'var(--v-error)';
   }
 
+  function localizeCategory(c) {
+    const labelKey = `cat_${c.key}`;
+    const label = t(labelKey);
+    let detail = c.detail || '';
+    if (c.key === 'system_prompt') {
+      detail = c.count ? t('detail_system_prompt', { n: c.count }) : t('detail_system_prompt_fallback');
+    } else if (c.count != null && ['tool_outputs', 'assistant', 'tool_defs', 'user'].includes(c.key)) {
+      detail = t(`detail_${c.key}`, { n: c.count });
+    } else if (['cache_read', 'uncached_input', 'output'].includes(c.key)) {
+      detail = t(`detail_${c.key}`);
+    }
+    return { label: label === labelKey ? c.label : label, detail };
+  }
+
+  function formatAlert(alertObj, ctxPct, latestContextUsed, limit) {
+    if (!alertObj) return null;
+    if (alertObj.code === 'cache_drop' && alertObj.params) {
+      const p = alertObj.params;
+      const warmStr = p.avgWarmTtft != null ? `${p.avgWarmTtft.toFixed(2)}s` : t('alertWarmDefault');
+      const ttftPart =
+        p.ttftSec != null ? t('alertCacheDropTtft', { cur: p.ttftSec.toFixed(2), warm: warmStr }) : '';
+      return {
+        level: alertObj.level,
+        title: t('alertCacheDropTitle', { rate: p.cacheRate }),
+        desc: t('alertCacheDropDesc', {
+          id: p.turnId,
+          tokens: Number(p.totalPrompt || 0).toLocaleString(),
+          ttftPart,
+        }),
+      };
+    }
+    if (alertObj.code === 'context_high') {
+      const pctVal = alertObj.params?.ctxPct ?? Number(ctxPct.toFixed(1));
+      const usedVal = alertObj.params?.contextUsed ?? latestContextUsed;
+      const limitVal = alertObj.params?.contextLimit ?? limit;
+      return {
+        level: alertObj.level,
+        title: t('alertCtxHighTitle', { pct: pctVal.toFixed(1) }),
+        desc: t('alertCtxHighDesc', {
+          used: Number(usedVal).toLocaleString(),
+          limit: Number(limitVal).toLocaleString(),
+        }),
+      };
+    }
+    return alertObj;
+  }
+
+  function syncLangButton() {
+    const btn = $('langToggleBtn');
+    if (btn) btn.textContent = t('langLabel');
+  }
+
   // ---------- Smooth 100ms Live Clocks ----------
   function updateLiveClocks() {
     const data = state.data;
@@ -214,8 +270,8 @@
       if (lt.phase === 'waiting_ttft' && lt.startedAtMs) {
         const waitSec = Math.max(0, (now - lt.startedAtMs) / 1000);
         $('kpiTtft').textContent = `${waitSec.toFixed(1)}s…`;
-        $('lastTurnLabel').textContent = '请求中';
-        $('lastTurnMeta').textContent = `等待首字 · 已耗时 ${waitSec.toFixed(1)}s`;
+        $('lastTurnLabel').textContent = t('stripRequesting');
+        $('lastTurnMeta').textContent = t('stripWaitingTtft', { sec: waitSec.toFixed(1) });
       } else if (lt.phase === 'streaming' && lt.streamingStartedAtMs) {
         const decSec = Math.max(0.1, (now - lt.streamingStartedAtMs) / 1000);
         const estTok = lt.estOutputTokens || 0;
@@ -224,8 +280,11 @@
           $('kpiTps').textContent = liveTps.toFixed(1);
         }
         $('kpiTtft').textContent = fmtSec(lt.elapsedTtftSec);
-        $('lastTurnLabel').textContent = '生成中';
-        $('lastTurnMeta').textContent = `~${fmtNum(estTok)} tok · 解码 ${decSec.toFixed(1)}s`;
+        $('lastTurnLabel').textContent = t('stripGenerating');
+        $('lastTurnMeta').textContent = t('stripStreamingMeta', {
+          tok: fmtNum(estTok),
+          sec: decSec.toFixed(1),
+        });
       }
     }
 
@@ -241,40 +300,39 @@
     }
   }
 
-  // ---------- Shared Status / Live Section Renderer (used by both full & surgical updates) ----------
+  // ---------- Shared Status / Live Section Renderer ----------
   function renderStatusAndLive(data) {
     const s = data.summary;
     const turns = data.turns || [];
     const last = turns[turns.length - 1];
     const mode = effectiveTpsMode(data);
 
-    // Live dot + footer sync
     const liveDot = $('liveDot');
     if (state.stale) {
       liveDot.className = 'live-dot dot-warn';
-      $('footerSync').textContent = '连接中断 · 重试中…';
+      $('footerSync').textContent = t('syncDisconnected');
     } else if (data.activity === 'waiting_ttft') {
       liveDot.className = 'live-dot dot-live';
-      $('footerSync').textContent = '等待首字 · 0.35s';
+      $('footerSync').textContent = t('syncWaitingTtft');
     } else if (data.activity === 'streaming') {
       liveDot.className = 'live-dot dot-live';
-      $('footerSync').textContent = '流式采样 · 0.35s';
+      $('footerSync').textContent = t('syncStreaming');
     } else if (data.activity === 'tool_running') {
       liveDot.className = 'live-dot dot-live';
-      $('footerSync').textContent = '工具运行 · 0.35s';
+      $('footerSync').textContent = t('syncToolRunning');
     } else if (data.alert?.level === 'error') {
       liveDot.className = 'live-dot dot-err';
-      $('footerSync').textContent = '实时监测 · 0.9s';
+      $('footerSync').textContent = t('syncLiveIdle');
     } else if (data.alert?.level === 'warning') {
       liveDot.className = 'live-dot dot-warn';
-      $('footerSync').textContent = '实时监测 · 0.9s';
+      $('footerSync').textContent = t('syncLiveIdle');
     } else {
       liveDot.className = 'live-dot dot-ok';
-      $('footerSync').textContent = '实时监测 · 0.9s';
+      $('footerSync').textContent = t('syncLiveIdle');
     }
 
     // KPI 1: TPS & TTFT
-    $('tpsTitle').textContent = mode === 'decode' ? '纯解码 TPS' : '端到端 TPS';
+    $('tpsTitle').textContent = mode === 'decode' ? t('kpiDecodeTps') : t('kpiE2eTps');
     let mainTps = mode === 'decode' ? s.headlineDecodeTps : s.latestE2eTps;
     if (data.activity === 'streaming' && data.liveTurn?.estLiveTps != null) {
       mainTps = data.liveTurn.estLiveTps;
@@ -289,22 +347,22 @@
 
     const tpsTag = $('tpsStateTag');
     if (data.activity === 'waiting_ttft') {
-      tpsTag.textContent = '等待首字';
+      tpsTag.textContent = t('stateWaitingTtft');
       tpsTag.className = 'mono tag-live';
     } else if (data.activity === 'streaming') {
-      tpsTag.textContent = data.liveTurn?.estLiveTps != null ? '流式实时' : '生成中';
+      tpsTag.textContent = data.liveTurn?.estLiveTps != null ? t('stateStreamingLive') : t('stateStreaming');
       tpsTag.className = 'mono tag-live';
     } else if (data.activity === 'tool_running') {
-      tpsTag.textContent = '工具中';
+      tpsTag.textContent = t('stateToolRunning');
       tpsTag.className = 'mono tag-live';
     } else if (mode === 'decode' && s.headlineDecodeIsFallback) {
-      tpsTag.textContent = '上轮稳态';
+      tpsTag.textContent = t('statePrevSteady');
       tpsTag.className = 'mono muted';
     } else if (last.cacheRate < 20) {
-      tpsTag.textContent = '冷预填充';
+      tpsTag.textContent = t('stateColdPrefill');
       tpsTag.className = 'mono tag-warn';
     } else {
-      tpsTag.textContent = '暖缓存';
+      tpsTag.textContent = t('stateWarmCache');
       tpsTag.className = 'mono tag-ok';
     }
 
@@ -312,23 +370,25 @@
     const stripCard = $('lastTurnCard');
     stripCard.classList.toggle('is-live', data.activity === 'streaming' || data.activity === 'waiting_ttft');
     if (data.activity === 'waiting_ttft' && data.liveTurn) {
-      $('lastTurnLabel').textContent = '请求中';
-      $('lastTurnMeta').textContent = `等待首字 · 已耗时 ${data.liveTurn.elapsedTtftSec.toFixed(1)}s`;
+      $('lastTurnLabel').textContent = t('stripRequesting');
+      $('lastTurnMeta').textContent = t('stripWaitingTtft', { sec: data.liveTurn.elapsedTtftSec.toFixed(1) });
     } else if (data.activity === 'streaming' && data.liveTurn) {
-      $('lastTurnLabel').textContent = '生成中';
-      $('lastTurnMeta').textContent = `~${fmtNum(data.liveTurn.estOutputTokens)} tok · 解码 ${(data.liveTurn.elapsedDecodeSec || 0).toFixed(1)}s`;
+      $('lastTurnLabel').textContent = t('stripGenerating');
+      $('lastTurnMeta').textContent = t('stripStreamingMeta', {
+        tok: fmtNum(data.liveTurn.estOutputTokens),
+        sec: (data.liveTurn.elapsedDecodeSec || 0).toFixed(1),
+      });
     } else {
-      $('lastTurnLabel').textContent = '最近调用';
-      const durStr = last.e2eSec != null ? `耗时 ${last.e2eSec.toFixed(1)}s` : '无耗时';
-      $('lastTurnMeta').textContent = `#${last.id} · 输出 ${fmtNum(last.totalOutput)} tok · ${durStr}`;
+      $('lastTurnLabel').textContent = t('stripLatest');
+      const durStr = last.e2eSec != null ? t('stripDur', { sec: last.e2eSec.toFixed(1) }) : t('stripNoDur');
+      $('lastTurnMeta').textContent = t('stripLatestMeta', {
+        id: last.id,
+        tok: fmtNum(last.totalOutput),
+        dur: durStr,
+      });
     }
   }
 
-  /**
-   * Surgical live update when `historyRev` is unchanged during streaming:
-   * updates only live KPI/status/strip (and tools card if `toolsRev` changed),
-   * completely skipping SVG chart, turns ledger, and 100-cell grid rebuilds.
-   */
   function renderLivePatch(data) {
     renderStatusAndLive(data);
     if (data.toolsRev !== state.renderedToolsRev) {
@@ -341,6 +401,7 @@
 
   // ---------- Full Rendering ----------
   function render() {
+    syncLangButton();
     const data = state.data;
     const conv = state.conv || data?.conversationId || '';
     $('footerConv').textContent = conv ? `conv: ${conv.slice(0, 8)}…` : 'conv: --';
@@ -350,18 +411,18 @@
       state.renderedToolsRev = '';
       $('emptyState').classList.remove('hidden');
       $('content').classList.add('hidden');
-      $('modelLabel').textContent = 'Vitals · 等待会话';
+      $('modelLabel').textContent = t('waitingSessionShort');
       $('turnsCountBadge').textContent = '0';
       $('sourceBadge').textContent = data?.source === 'transcript' ? 'JSONL' : 'SQLite';
       $('liveDot').className = `live-dot ${state.stale ? 'dot-warn' : 'dot-live'}`;
       $('emptyTitle').textContent =
         data?.activity === 'waiting_ttft' || data?.activity === 'streaming'
-          ? '首轮模型正在生成中…'
+          ? t('emptyTitleStreaming')
           : conv
-            ? '等待本会话首次模型调用'
-            : '未检测到活跃会话';
-      $('emptyHintText').textContent = conv ? `监听中 (${conv.slice(0, 8)}…)` : '在左侧选择任意会话即可实时监测';
-      $('footerSync').textContent = state.stale ? '重连中…' : '等待数据 · 1.5s';
+            ? t('emptyTitleWaiting')
+            : t('emptyTitleNoConv');
+      $('emptyHintText').textContent = conv ? t('emptyHintWatching', { id: conv.slice(0, 8) }) : t('emptyHintSelect');
+      $('footerSync').textContent = state.stale ? t('syncReconnecting') : t('syncWaitingData');
       syncLiveClock();
       return;
     }
@@ -375,57 +436,53 @@
     const limit = activeContextLimit(data);
     const mode = effectiveTpsMode(data);
 
-    // Header
     $('modelLabel').textContent = data.model?.display || data.model?.id || 'Unknown Model';
     $('modelLabel').title = `${data.model?.display || ''} (${data.model?.id || ''})`;
     $('turnsCountBadge').textContent = String(turns.length);
 
     const srcBadge = $('sourceBadge');
     srcBadge.textContent = data.source === 'sqlite' ? 'SQLite' : 'JSONL';
-    srcBadge.title =
-      data.source === 'sqlite'
-        ? '方案 A：只读解析 conversations/<id>.db 的 gen_metadata 精确毫秒遥测'
-        : '降级模式：读取 transcript.jsonl（Token 与缓存精确，TPS 为端到端估算）';
+    srcBadge.title = data.source === 'sqlite' ? t('sourceTitleSqlite') : t('sourceTitleJsonl');
 
     const tpsBtn = $('tpsModeBtn');
     tpsBtn.textContent = mode === 'decode' ? 'Decode' : 'E2E';
     tpsBtn.disabled = data.tpsPrecision !== 'decode';
-    tpsBtn.title =
-      data.tpsPrecision === 'decode'
-        ? '点击切换纯解码 TPS (Decode) 与端到端 TPS (E2E)'
-        : '当前处于 JSONL 降级模式，仅提供端到端 (E2E) 口径';
+    tpsBtn.title = data.tpsPrecision === 'decode' ? t('tpsBtnTitleDecode') : t('tpsBtnTitleFallback');
 
-    // Dismissible Alert Banner
+    // Dismissible Localized Alert Banner
     const ctxPct = limit > 0 ? (s.latestContextUsed / limit) * 100 : 0;
-    let alertObj = data.alert;
-    if (!alertObj && ctxPct >= 80) {
-      alertObj = {
+    let rawAlert = data.alert;
+    if (!rawAlert && ctxPct >= 80) {
+      rawAlert = {
         code: 'context_high',
         level: ctxPct >= 92 ? 'error' : 'warning',
-        title: `上下文窗口接近上限（${ctxPct.toFixed(1)}%）`,
-        desc: `当前占用 ${s.latestContextUsed.toLocaleString()} / ${limit.toLocaleString()} tokens。建议使用 /compact 压缩历史上下文。`,
+        params: {
+          ctxPct: Number(ctxPct.toFixed(1)),
+          contextUsed: s.latestContextUsed,
+          contextLimit: limit,
+        },
       };
     }
 
     let alertKey = '';
-    if (alertObj) {
+    if (rawAlert) {
       alertKey =
-        alertObj.code === 'context_high'
-          ? `${conv}:context_high:${alertObj.level}:${Math.floor(ctxPct / 5) * 5}`
-          : `${conv}:${alertObj.code || 'alert'}:${last.id}`;
+        rawAlert.code === 'context_high'
+          ? `${conv}:context_high:${rawAlert.level}:${Math.floor(ctxPct / 5) * 5}`
+          : `${conv}:${rawAlert.code || 'alert'}:${last.id}`;
     }
     state.currentAlertKey = alertKey;
 
     const alertEl = $('alertBanner');
-    if (alertObj && !state.dismissedAlerts.has(alertKey)) {
-      alertEl.className = `alert-banner level-${alertObj.level === 'error' ? 'error' : 'warning'}`;
-      $('alertTitle').textContent = alertObj.title;
-      $('alertDesc').textContent = alertObj.desc;
+    const formattedAlert = formatAlert(rawAlert, ctxPct, s.latestContextUsed, limit);
+    if (formattedAlert && !state.dismissedAlerts.has(alertKey)) {
+      alertEl.className = `alert-banner level-${formattedAlert.level === 'error' ? 'error' : 'warning'}`;
+      $('alertTitle').textContent = formattedAlert.title;
+      $('alertDesc').textContent = formattedAlert.desc;
     } else {
       alertEl.className = 'alert-banner hidden';
     }
 
-    // Status, KPI 1 & Latest Strip
     renderStatusAndLive(data);
 
     // KPI 2: Cache Hit Rate
@@ -441,10 +498,10 @@
             : 'var(--v-error)';
 
     const cacheTrend = $('cacheTrend');
-    cacheTrend.textContent = `本轮 ${s.latestCacheRate.toFixed(1)}%`;
+    cacheTrend.textContent = t('kpiTurnCache', { pct: s.latestCacheRate.toFixed(1) });
     cacheTrend.style.color = cacheToneColor(s.latestCacheRate);
     $('kpiCacheSaved').textContent = fmtNum(s.totalCacheRead);
-    $('kpiCacheCold').textContent = `冷启 ${s.coldCount}`;
+    $('kpiCacheCold').textContent = t('kpiColdCount', { n: s.coldCount });
 
     // KPI 3: Context Utilization
     const limitBtn = $('limitCycleBtn');
@@ -455,11 +512,11 @@
     kpiCtxPct.textContent = `${Math.min(100, ctxPct).toFixed(1)}%`;
     kpiCtxPct.style.color =
       ctxPct >= 80 ? 'var(--v-error)' : ctxPct >= 65 ? 'var(--v-warning)' : 'var(--v-fg)';
-    $('kpiCtxUsed').textContent = `${fmtNum(s.latestContextUsed)} 已用`;
-    $('kpiCtxLeft').textContent = `余 ${fmtNum(Math.max(0, limit - s.latestContextUsed))}`;
+    $('kpiCtxUsed').textContent = t('kpiCtxUsed', { n: fmtNum(s.latestContextUsed) });
+    $('kpiCtxLeft').textContent = t('kpiCtxLeft', { n: fmtNum(Math.max(0, limit - s.latestContextUsed)) });
 
     // KPI 4: Session Tokens
-    $('kpiCalls').textContent = `${s.turnCount} 次`;
+    $('kpiCalls').textContent = t('kpiCallsCount', { n: s.turnCount });
     $('kpiTotalTok').textContent = fmtNum(s.totalTokensAll);
     $('kpiInTok').textContent = fmtNum(s.totalPromptAll);
     $('kpiOutTok').textContent = fmtNum(s.totalOutputAll);
@@ -496,30 +553,31 @@
     const listEl = $('toolsList');
 
     if (!toolStats || toolStats.totalCalls === 0) {
-      summaryEl.textContent = '0 次';
+      summaryEl.textContent = t('toolsCallsUnit', { n: 0 });
       activeWrap.classList.add('hidden');
       activeWrap.innerHTML = '';
-      listEl.innerHTML = `<div class="tools-empty">本会话尚未调用工具</div>`;
+      listEl.innerHTML = `<div class="tools-empty">${esc(t('toolsEmpty'))}</div>`;
       return;
     }
 
-    const errText = toolStats.errorCalls > 0 ? ` · ${toolStats.errorCalls} 错` : '';
-    const durText = toolStats.totalDurationSec > 0 ? ` · ${fmtDurShort(toolStats.totalDurationSec)}` : '';
-    summaryEl.textContent = `${toolStats.totalCalls} 次${durText}${errText}`;
+    const parts = [t('toolsCallsUnit', { n: toolStats.totalCalls })];
+    if (toolStats.totalDurationSec > 0) parts.push(fmtDurShort(toolStats.totalDurationSec));
+    if (toolStats.errorCalls > 0) parts.push(t('toolsErrorsUnit', { n: toolStats.errorCalls }));
+    summaryEl.textContent = parts.join(' · ');
 
     const active = toolStats.activeTools || [];
     if (active.length > 0) {
       activeWrap.classList.remove('hidden');
       activeWrap.innerHTML = active
         .map(
-          (t, idx) => `
+          (tool, idx) => `
           <div class="active-tool-pill">
             <span class="active-tool-left">
               <span class="live-dot dot-live" aria-hidden="true"></span>
-              <span class="mono strong truncate">${esc(t.name)}</span>
-              <span class="muted">运行中</span>
+              <span class="mono strong truncate">${esc(tool.name)}</span>
+              <span class="muted">${esc(t('toolsRunning'))}</span>
             </span>
-            <span id="active-tool-timer-${idx}" class="mono strong">${(t.elapsedSec || 0).toFixed(1)}s</span>
+            <span id="active-tool-timer-${idx}" class="mono strong">${(tool.elapsedSec || 0).toFixed(1)}s</span>
           </div>
         `
         )
@@ -530,29 +588,32 @@
     }
 
     const top = (toolStats.hotspots || []).slice(0, 5);
-    const maxCount = Math.max(1, ...top.map((t) => t.count));
+    const maxCount = Math.max(1, ...top.map((item) => item.count));
 
     listEl.innerHTML = top
-      .map((t) => {
-        const w = Math.max(6, (t.count / maxCount) * 100);
-        const dur = t.totalDurationSec > 0 ? fmtDurShort(t.totalDurationSec) : '';
-        const errPill = t.errors > 0 ? `<span class="tool-err-pill mono">${t.errors} 错</span>` : '';
-        const runDot = t.running > 0 ? `<span class="live-dot dot-live" aria-hidden="true"></span>` : '';
+      .map((item) => {
+        const w = Math.max(6, (item.count / maxCount) * 100);
+        const dur = item.totalDurationSec > 0 ? fmtDurShort(item.totalDurationSec) : '';
+        const errPill =
+          item.errors > 0
+            ? `<span class="tool-err-pill mono">${esc(t('toolsErrorsUnit', { n: item.errors }))}</span>`
+            : '';
+        const runDot = item.running > 0 ? `<span class="live-dot dot-live" aria-hidden="true"></span>` : '';
         return `
           <div class="tool-row">
             <div class="tool-row-head">
               <span class="tool-name-wrap">
                 ${runDot}
-                <span class="tool-name mono truncate">${esc(t.name)}</span>
+                <span class="tool-name mono truncate">${esc(item.name)}</span>
                 ${errPill}
               </span>
               <span class="tool-metrics mono">
-                <span class="strong">×${t.count}</span>
+                <span class="strong">×${item.count}</span>
                 ${dur ? `<span>${dur}</span>` : ''}
               </span>
             </div>
             <div class="tool-bar-track">
-              <div class="tool-bar-fill${t.running > 0 ? ' is-running' : ''}" style="width: ${w.toFixed(1)}%;"></div>
+              <div class="tool-bar-fill${item.running > 0 ? ' is-running' : ''}" style="width: ${w.toFixed(1)}%;"></div>
             </div>
           </div>
         `;
@@ -563,7 +624,7 @@
   function renderTrendChart(turns, mode) {
     const wrap = $('svgChartWrap');
     const recent = turns.slice(-12);
-    $('chartTitle').textContent = recent.length < 12 ? `最近 ${recent.length} 轮趋势` : '最近 12 轮趋势';
+    $('chartTitle').textContent = t('chartTitleRecent', { n: recent.length || 12 });
     const insp = $('chartInspectorVal');
 
     if (recent.length === 0) {
@@ -584,27 +645,36 @@
     const latest = recent[n - 1];
 
     if (state.chartMode === 'tps') {
-      const getVal = (t) => (mode === 'decode' ? t.decodeTps : t.e2eTps);
+      const getVal = (turn) => (mode === 'decode' ? turn.decodeTps : turn.e2eTps);
       const validVals = recent.map(getVal).filter((v) => v != null && v > 0);
       const maxTps = Math.max(80, ...(validVals.length ? validVals : [100])) * 1.12;
-      const maxTtft = Math.max(4, ...recent.map((t) => t.ttftSec || 0));
+      const maxTtft = Math.max(4, ...recent.map((turn) => turn.ttftSec || 0));
       const stepX = n > 1 ? innerW / (n - 1) : 0;
 
-      const formatInsp = (t) => {
-        const v = getVal(t);
-        if (mode === 'decode' && t.isShortSample) {
-          return `#${t.id} · 短采样 ${fmtSec(t.decodeSec, 1)}/${t.totalOutput}t · TTFT ${fmtSec(t.ttftSec)}`;
+      const formatInsp = (turn) => {
+        const v = getVal(turn);
+        if (mode === 'decode' && turn.isShortSample) {
+          return t('inspShortSample', {
+            id: turn.id,
+            sec: fmtSec(turn.decodeSec, 1),
+            tok: turn.totalOutput,
+            ttft: fmtSec(turn.ttftSec),
+          });
         }
-        return `#${t.id} · ${v != null ? v.toFixed(1) : '--'} t/s · TTFT ${fmtSec(t.ttftSec)}`;
+        return t('inspTps', {
+          id: turn.id,
+          tps: v != null ? v.toFixed(1) : '--',
+          ttft: fmtSec(turn.ttftSec),
+        });
       };
       insp.textContent = formatInsp(latest);
 
-      const points = recent.map((t, i) => {
+      const points = recent.map((turn, i) => {
         const cx = n > 1 ? padL + i * stepX : padL + innerW / 2;
-        const v = getVal(t);
+        const v = getVal(turn);
         const cy = v != null ? padT + innerH - (v / maxTps) * innerH : null;
-        const barH = t.ttftSec != null ? Math.max(3, (t.ttftSec / maxTtft) * (innerH * 0.65)) : 0;
-        return { cx, cy, v, barH, t, idx: i };
+        const barH = turn.ttftSec != null ? Math.max(3, (turn.ttftSec / maxTtft) * (innerH * 0.65)) : 0;
+        return { cx, cy, v, barH, turn, idx: i };
       });
 
       const validPoints = points.filter((p) => p.cy != null);
@@ -627,7 +697,7 @@
             .map((p) =>
               p.barH > 0
                 ? `<rect x="${(p.cx - 4).toFixed(1)}" y="${(padT + innerH - p.barH).toFixed(1)}" width="8" height="${p.barH.toFixed(1)}" rx="2" fill="${
-                    (p.t.ttftSec || 0) > 6 ? 'var(--v-warning)' : 'var(--v-chart-3)'
+                    (p.turn.ttftSec || 0) > 6 ? 'var(--v-warning)' : 'var(--v-chart-3)'
                   }" opacity="0.28" />`
                 : ''
             )
@@ -645,7 +715,7 @@
                   <circle cx="${p.cx.toFixed(1)}" cy="${dotY.toFixed(1)}" r="${dotR}" fill="var(--v-card)" stroke="${strokeColor}" stroke-width="${p.cy != null ? '2' : '1.4'}" ${p.cy == null ? 'stroke-dasharray="2 1.5"' : ''} />
                   ${
                     idx === 0 || idx === n - 1 || idx % 3 === 0
-                      ? `<text x="${p.cx.toFixed(1)}" y="${H - 3}" text-anchor="middle" fill="var(--v-muted)" font-size="9" font-family="monospace">#${p.t.id}</text>`
+                      ? `<text x="${p.cx.toFixed(1)}" y="${H - 3}" text-anchor="middle" fill="var(--v-muted)" font-size="9" font-family="monospace">#${p.turn.id}</text>`
                       : ''
                   }
                 </g>
@@ -662,7 +732,12 @@
         });
       });
     } else {
-      const formatInsp = (t) => `#${t.id} · 命中 ${t.cacheRate.toFixed(1)}% · 读 ${fmtNum(t.cacheReadTokens)}`;
+      const formatInsp = (turn) =>
+        t('inspCache', {
+          id: turn.id,
+          rate: turn.cacheRate.toFixed(1),
+          read: fmtNum(turn.cacheReadTokens),
+        });
       insp.textContent = formatInsp(latest);
 
       const barSlot = innerW / n;
@@ -676,17 +751,17 @@
           <text x="${padL - 4}" y="${padT + 4}" text-anchor="end" fill="var(--v-muted)" font-size="9" font-family="monospace">100%</text>
           <text x="${padL - 4}" y="${padT + innerH}" text-anchor="end" fill="var(--v-muted)" font-size="9" font-family="monospace">0%</text>
           ${recent
-            .map((t, idx) => {
+            .map((turn, idx) => {
               const cx = padL + idx * barSlot + barSlot / 2;
-              const bh = Math.max(4, (t.cacheRate / 100) * innerH);
-              const color = cacheToneColor(t.cacheRate);
+              const bh = Math.max(4, (turn.cacheRate / 100) * innerH);
+              const color = cacheToneColor(turn.cacheRate);
               return `
                 <g class="chart-bar" data-idx="${idx}" style="cursor:pointer;">
                   <rect x="${(cx - barSlot / 2).toFixed(1)}" y="${padT}" width="${barSlot.toFixed(1)}" height="${innerH}" fill="transparent" />
                   <rect x="${(cx - barW / 2).toFixed(1)}" y="${(padT + innerH - bh).toFixed(1)}" width="${barW.toFixed(1)}" height="${bh.toFixed(1)}" rx="3" fill="${color}" opacity="0.88" />
                   ${
                     idx === 0 || idx === n - 1 || idx % 3 === 0
-                      ? `<text x="${cx.toFixed(1)}" y="${H - 3}" text-anchor="middle" fill="var(--v-muted)" font-size="9" font-family="monospace">#${t.id}</text>`
+                      ? `<text x="${cx.toFixed(1)}" y="${H - 3}" text-anchor="middle" fill="var(--v-muted)" font-size="9" font-family="monospace">#${turn.id}</text>`
                       : ''
                   }
                 </g>
@@ -707,72 +782,78 @@
 
   function renderTurnsList(turns, mode) {
     const container = $('turnsList');
-    const filtered = [...turns].reverse().filter((t) => {
-      if (state.turnFilter === 'cold') return t.cacheRate < 40;
-      if (state.turnFilter === 'tool') return t.kind === 'tool';
+    const filtered = [...turns].reverse().filter((turn) => {
+      if (state.turnFilter === 'cold') return turn.cacheRate < 40;
+      if (state.turnFilter === 'tool') return turn.kind === 'tool';
       return true;
     });
 
     if (!filtered.length) {
-      container.innerHTML = `<div class="card empty-filter">当前筛选条件下无匹配轮次</div>`;
+      container.innerHTML = `<div class="card empty-filter">${esc(t('turnsEmptyFilter'))}</div>`;
       return;
     }
 
     container.innerHTML = filtered
-      .map((t) => {
-        const isOpen = state.expandedTurnId === t.id;
-        const isShortInDecode = mode === 'decode' && t.isShortSample;
-        const shownTps = mode === 'decode' ? t.decodeTps : t.e2eTps;
-        const color = cacheToneColor(t.cacheRate);
+      .map((turn) => {
+        const isOpen = state.expandedTurnId === turn.id;
+        const isShortInDecode = mode === 'decode' && turn.isShortSample;
+        const shownTps = mode === 'decode' ? turn.decodeTps : turn.e2eTps;
+        const color = cacheToneColor(turn.cacheRate);
 
         const kindBadge =
-          t.kind === 'tool'
-            ? `<span class="turn-badge mono">Tool×${t.tools}</span>`
+          turn.kind === 'tool'
+            ? `<span class="turn-badge mono">Tool×${turn.tools}</span>`
             : `<span class="turn-badge reply mono">Reply</span>`;
+        const shortTip = t('badgeShortSampleTip', {
+          sec: fmtSec(turn.decodeSec),
+          tok: turn.totalOutput,
+        });
         const shortBadge = isShortInDecode
-          ? `<span class="turn-badge burst mono" title="流式解码仅 ${fmtSec(t.decodeSec)}（${t.totalOutput} tok），首包缓冲导致纯解码速率偏高，已过滤以免失真">短采样</span>`
+          ? `<span class="turn-badge burst mono" title="${esc(shortTip)}">${esc(t('badgeShortSample'))}</span>`
           : '';
 
         return `
           <div class="turn-card">
-            <button type="button" class="turn-row" data-turn-id="${t.id}" aria-expanded="${isOpen}">
+            <button type="button" class="turn-row" data-turn-id="${turn.id}" aria-expanded="${isOpen}">
               <div class="turn-row-top">
                 <div class="turn-meta">
-                  <span class="turn-id mono">#${t.id}</span>
+                  <span class="turn-id mono">#${turn.id}</span>
                   ${kindBadge}
                   ${shortBadge}
-                  <span class="muted mono">${esc(fmtClock(t.timestampMs))}</span>
+                  <span class="muted mono">${esc(fmtClock(turn.timestampMs))}</span>
                 </div>
                 <div class="turn-nums mono">
                   <span class="${isShortInDecode ? 'muted' : 'strong'}">${
-                    isShortInDecode ? `${fmtTps(t.e2eTps)} e2e` : `${fmtTps(shownTps)} t/s`
+                    isShortInDecode ? `${fmtTps(turn.e2eTps)} e2e` : `${fmtTps(shownTps)} t/s`
                   }</span>
-                  <span style="color: ${color};">${t.cacheRate.toFixed(0)}%</span>
+                  <span style="color: ${color};">${turn.cacheRate.toFixed(0)}%</span>
                 </div>
               </div>
               <div class="turn-bar">
-                <div class="turn-bar-fill" style="width: ${Math.max(3, t.cacheRate)}%; background: ${color};"></div>
+                <div class="turn-bar-fill" style="width: ${Math.max(3, turn.cacheRate)}%; background: ${color};"></div>
               </div>
             </button>
             ${
               isOpen
                 ? `
                 <div class="turn-details mono">
-                  <div class="detail-kv"><span class="muted">纯解码 TPS</span><span>${
-                    t.isShortSample ? `短采样 (${fmtTps(t.rawDecodeTps)})` : `${fmtTps(t.decodeTps)} t/s`
+                  <div class="detail-kv"><span class="muted">${esc(t('detailDecodeTps'))}</span><span>${
+                    turn.isShortSample
+                      ? esc(t('detailShortSampleVal', { tps: fmtTps(turn.rawDecodeTps) }))
+                      : `${fmtTps(turn.decodeTps)} t/s`
                   }</span></div>
-                  <div class="detail-kv"><span class="muted">端到端 TPS</span><span>${fmtTps(t.e2eTps)} t/s</span></div>
-                  <div class="detail-kv"><span class="muted">首字 TTFT</span><span>${fmtSec(t.ttftSec)}</span></div>
-                  <div class="detail-kv"><span class="muted">解码耗时</span><span>${fmtSec(t.decodeSec)}</span></div>
-                  <div class="detail-kv"><span class="muted">缓存读取</span><span>${fmtNum(t.cacheReadTokens)}</span></div>
-                  <div class="detail-kv"><span class="muted">新增输入</span><span>${fmtNum(t.inputTokens)}</span></div>
+                  <div class="detail-kv"><span class="muted">${esc(t('detailE2eTps'))}</span><span>${fmtTps(turn.e2eTps)} t/s</span></div>
+                  <div class="detail-kv"><span class="muted">${esc(t('detailTtft'))}</span><span>${fmtSec(turn.ttftSec)}</span></div>
+                  <div class="detail-kv"><span class="muted">${esc(t('detailDecodeDur'))}</span><span>${fmtSec(turn.decodeSec)}</span></div>
+                  <div class="detail-kv"><span class="muted">${esc(t('detailCacheRead'))}</span><span>${fmtNum(turn.cacheReadTokens)}</span></div>
+                  <div class="detail-kv"><span class="muted">${esc(t('detailUncachedIn'))}</span><span>${fmtNum(turn.inputTokens)}</span></div>
                   ${
-                    t.cacheCreationTokens > 0
-                      ? `<div class="detail-kv"><span class="muted">缓存写入</span><span>${fmtNum(t.cacheCreationTokens)}</span></div><div class="detail-kv"><span class="muted">上下文合计</span><span>${fmtNum(t.contextUsed)}</span></div>`
+                    turn.cacheCreationTokens > 0
+                      ? `<div class="detail-kv"><span class="muted">${esc(t('detailCacheWrite'))}</span><span>${fmtNum(turn.cacheCreationTokens)}</span></div><div class="detail-kv"><span class="muted">${esc(t('detailContextTotal'))}</span><span>${fmtNum(turn.contextUsed)}</span></div>`
                       : ''
                   }
-                  <div class="detail-kv"><span class="muted">Thinking</span><span>${fmtNum(t.thinkingTokens)}</span></div>
-                  <div class="detail-kv"><span class="muted">Reply / Tool</span><span>${fmtNum(t.responseTokens)}</span></div>
+                  <div class="detail-kv"><span class="muted">${esc(t('detailThinking'))}</span><span>${fmtNum(turn.thinkingTokens)}</span></div>
+                  <div class="detail-kv"><span class="muted">${esc(t('detailReplyTool'))}</span><span>${fmtNum(turn.responseTokens)}</span></div>
                 </div>
               `
                 : ''
@@ -794,9 +875,9 @@
   function renderBreakdown(data, limit) {
     const bd = data.breakdown;
     const s = data.summary;
-    const cats = bd?.categories || [];
+    const cats = (bd?.categories || []).map((c) => ({ ...c, ...localizeCategory(c) }));
 
-    $('breakdownModeTag').textContent = bd?.mode === 'exact_snapshot' ? 'SQLite 实测' : 'JSONL 概算';
+    $('breakdownModeTag').textContent = bd?.mode === 'exact_snapshot' ? t('modeExact') : t('modeFallback');
 
     const cells = [];
     for (const c of cats) {
@@ -814,7 +895,7 @@
     while (cells.length < 100) {
       cells.push({
         color: 'var(--v-secondary)',
-        label: `剩余可用空间: ${fmtNum(freeTokens)} (${100 - usedCells}%)`,
+        label: t('gridFreeLabel', { tok: fmtNum(freeTokens), pct: 100 - usedCells }),
       });
     }
 
@@ -828,7 +909,7 @@
 
     $('gridUsedPct').textContent = `${usedCells}%`;
     $('gridFreePct').textContent = `${100 - usedCells}%`;
-    $('gridHoverText').textContent = '悬停格子查看成分';
+    $('gridHoverText').textContent = t('gridHoverHint');
 
     grid.querySelectorAll('.ctx-cell').forEach((el) => {
       el.addEventListener('mouseenter', () => {
@@ -868,20 +949,20 @@
     const badge = $('speedupBadge');
     if (s.ttftSpeedup != null) {
       if (s.ttftSpeedup >= 1) {
-        badge.textContent = `${s.ttftSpeedup.toFixed(1)}× 加速`;
+        badge.textContent = t('speedupFast', { x: s.ttftSpeedup.toFixed(1) });
         badge.style.color = 'var(--v-success)';
       } else {
-        badge.textContent = `${s.ttftSpeedup.toFixed(2)}× 比率`;
+        badge.textContent = t('speedupRatio', { x: s.ttftSpeedup.toFixed(2) });
         badge.style.color = 'var(--v-muted)';
       }
     } else if (s.warmCount > 0 && s.coldCount === 0) {
-      badge.textContent = '全暖缓存';
+      badge.textContent = t('speedupAllWarm');
       badge.style.color = 'var(--v-success)';
     } else if (s.coldCount > 0 && s.warmCount === 0) {
-      badge.textContent = '仅冷预填充';
+      badge.textContent = t('speedupAllCold');
       badge.style.color = 'var(--v-warning)';
     } else {
-      badge.textContent = '暂无 TTFT';
+      badge.textContent = t('speedupNone');
       badge.style.color = 'var(--v-muted)';
     }
 
@@ -926,6 +1007,14 @@
       state.dismissedAlerts.add(state.currentAlertKey);
     }
     $('alertBanner').className = 'alert-banner hidden';
+  });
+
+  $('langToggleBtn').addEventListener('click', () => {
+    if (!i18n) return;
+    const next = i18n.getLocale() === 'zh' ? 'en' : 'zh';
+    i18n.setLocale(next, true);
+    i18n.applyStaticI18n(document);
+    render();
   });
 
   $('tpsModeBtn').addEventListener('click', () => {
@@ -1036,6 +1125,7 @@
     }
   }
 
+  if (i18n) i18n.applyStaticI18n(document);
   state.visible = isPaneVisible();
   render();
   if (state.visible) {

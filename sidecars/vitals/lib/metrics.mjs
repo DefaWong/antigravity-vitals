@@ -203,6 +203,7 @@ function buildBreakdown(latestTurn, promptSnapshot, contextLimit) {
         key: 'tool_outputs',
         label: '工具输出与文件读取',
         detail: `${byRole.tool.count} 条结果`,
+        count: byRole.tool.count,
         rawTokens: byRole.tool.tokens,
         colorVar: 'var(--v-chart-1)',
       },
@@ -210,6 +211,7 @@ function buildBreakdown(latestTurn, promptSnapshot, contextLimit) {
         key: 'system_prompt',
         label: '系统提示词 / Skills / Rules',
         detail: sections.length ? `${sections.length} 个区块` : '系统指令',
+        count: sections.length,
         rawTokens: sysTokens + byRole.system.tokens,
         colorVar: 'var(--v-chart-2)',
       },
@@ -217,6 +219,7 @@ function buildBreakdown(latestTurn, promptSnapshot, contextLimit) {
         key: 'assistant',
         label: '历史回复与 Thinking',
         detail: `${byRole.assistant.count} 轮生成`,
+        count: byRole.assistant.count,
         rawTokens: byRole.assistant.tokens + latestTurn.totalOutput,
         colorVar: 'var(--v-chart-3)',
       },
@@ -224,6 +227,7 @@ function buildBreakdown(latestTurn, promptSnapshot, contextLimit) {
         key: 'tool_defs',
         label: '工具与 MCP 定义',
         detail: `${toolCount} 个工具`,
+        count: toolCount,
         rawTokens: toolDefTokens,
         colorVar: 'var(--v-chart-4)',
       },
@@ -231,6 +235,7 @@ function buildBreakdown(latestTurn, promptSnapshot, contextLimit) {
         key: 'user',
         label: '用户输入消息',
         detail: `${byRole.user.count} 条消息`,
+        count: byRole.user.count,
         rawTokens: byRole.user.tokens,
         colorVar: 'var(--v-chart-5)',
       },
@@ -246,6 +251,7 @@ function buildBreakdown(latestTurn, promptSnapshot, contextLimit) {
           key: c.key,
           label: c.label,
           detail: c.detail,
+          count: c.count,
           tokens,
           pctOfWindow: pct(tokens),
           pctOfUsed: ctx > 0 ? Number(((tokens / ctx) * 100).toFixed(1)) : 0,
@@ -486,6 +492,13 @@ export function computeVitals(conversationId, rawData, nowMs = Date.now()) {
       level: 'error',
       title: `Prompt 缓存失效（本轮命中率 ${latest.cacheRate.toFixed(0)}%）`,
       desc: `第 #${latest.id} 轮触发冷预填充（${latest.totalPrompt.toLocaleString()} tokens）${curTtft}。通常由模型切换、规则/MCP 变更或缓存过期引起。`,
+      params: {
+        turnId: latest.id,
+        cacheRate: Number(latest.cacheRate.toFixed(0)),
+        totalPrompt: latest.totalPrompt,
+        ttftSec: latest.ttftSec,
+        avgWarmTtft,
+      },
     };
   } else if (ctxPct >= 80) {
     alert = {
@@ -493,6 +506,11 @@ export function computeVitals(conversationId, rawData, nowMs = Date.now()) {
       level: ctxPct >= 92 ? 'error' : 'warning',
       title: `上下文窗口接近上限（${ctxPct.toFixed(1)}%）`,
       desc: `当前占用 ${latest.contextUsed.toLocaleString()} / ${contextLimit.toLocaleString()} tokens。建议使用 /compact 压缩历史上下文以保持响应速度。`,
+      params: {
+        ctxPct: Number(ctxPct.toFixed(1)),
+        contextUsed: latest.contextUsed,
+        contextLimit,
+      },
     };
   }
 

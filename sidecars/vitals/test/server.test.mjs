@@ -110,6 +110,10 @@ describe('vitals sidecar HTTP API', () => {
       assert.equal(cssRes.status, 200);
       assert.match(cssRes.headers['Content-Type'], /text\/css/);
 
+      const i18nRes = await app.dispatch('GET', '/i18n.js');
+      assert.equal(i18nRes.status, 200);
+      assert.match(i18nRes.headers['Content-Type'], /javascript/);
+
       const jsRes = await app.dispatch('GET', '/app.js');
       assert.equal(jsRes.status, 200);
       assert.match(jsRes.headers['Content-Type'], /javascript/);

@@ -1032,6 +1032,29 @@ button:focus-visible {
   color: var(--v-muted);
 }
 
+.footer-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+
+.lang-btn {
+  padding: 0 5px;
+  border-radius: 4px;
+  border: 1px solid var(--v-card-border);
+  background: var(--v-card);
+  color: var(--v-muted);
+  font-size: 10.5px;
+  line-height: 16px;
+  transition: color 0.12s ease, background 0.12s ease;
+}
+
+.lang-btn:hover {
+  color: var(--v-fg);
+  background: var(--v-secondary);
+}
+
 .footer-sync {
   flex: none;
 }
