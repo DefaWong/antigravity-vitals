@@ -11,10 +11,15 @@ import {
 
 const STEP_TYPE_USER_INPUT = 14;
 const STEP_TYPE_PLANNER_RESPONSE = 15;
+const STEP_TYPE_TOOL = 132;
 
 const STEP_STATUS_PENDING = 1;
 const STEP_STATUS_RUNNING = 2;
+const STEP_STATUS_DONE = 3;
 const STEP_STATUS_ERROR = 7;
+const STEP_STATUS_GENERATING = 8;
+
+const ACTIVE_STATUSES = new Set([STEP_STATUS_PENDING, STEP_STATUS_RUNNING, STEP_STATUS_GENERATING]);
 
 /**
  * Parse `ModelUsageStats` protobuf message (chat_model field 4 or field 17.2).
@@ -58,12 +63,7 @@ function parseContextBudget(bytes) {
 }
 
 /**
- * Extract context composition snapshot from a `chat_model` message (typically on the latest row).
- *
- * - `chat.f1`: rendered system prompt text (bytes)
- * - `chat.f2`: repeated ChatMessage (`f2`: role 1=user 2=assistant 3=system 4=tool, `f4`: token count)
- * - `chat.f8`: repeated ToolDefinition (`f1`: name, total message bytes)
- * - `chat.f16`: repeated SystemPromptSection (`f1`: section name, `f2`: body bytes)
+ * Extract context composition snapshot from a `chat_model` message.
  */
 function parsePromptSnapshot(chatFields) {
   const msgFields = findAllFields(chatFields, 2, 2);
@@ -200,15 +200,75 @@ export function parseGenMetadataRow(idx, dataBuf) {
 }
 
 /**
- * Extract step created_at timestamp (ms) from `steps.metadata` protobuf field 1.
+ * Parse `steps.metadata` protobuf:
+ * - `f1`: created_at Timestamp
+ * - `f4`: tool_call (`f1`: id, `f2`: tool name, `f3`: arguments JSON)
+ * - `f26`: status_transitions (`f1` repeated -> `f1`: status, `f2`: Timestamp)
  */
-function parseStepCreatedAtMs(metadataBuf) {
-  if (!metadataBuf) return null;
+function parseStepMetadata(metadataBuf) {
+  if (!metadataBuf) {
+    return { createdAtMs: null, toolName: '', transitions: {} };
+  }
   const fields = parseFields(metadataBuf);
-  if (!fields) return null;
+  if (!fields) {
+    return { createdAtMs: null, toolName: '', transitions: {} };
+  }
+
   const tsField = findField(fields, 1, 2);
-  if (!tsField) return null;
-  return decodeTimestampMs(tsField.bytes);
+  const createdAtMs = tsField ? decodeTimestampMs(tsField.bytes) : null;
+
+  let toolName = '';
+  const f4 = findField(fields, 4, 2);
+  if (f4) {
+    const f4Fields = parseFields(f4.bytes);
+    const nameField = findField(f4Fields, 2, 2);
+    if (nameField) toolName = decodeUtf8(nameField.bytes).trim();
+  }
+
+  const transitions = {};
+  const f26 = findField(fields, 26, 2);
+  if (f26) {
+    const f26Fields = parseFields(f26.bytes);
+    for (const tr of findAllFields(f26Fields, 1, 2)) {
+      const trFields = parseFields(tr.bytes);
+      const st = findField(trFields, 1, 0)?.value;
+      const at = decodeTimestampMs(findField(trFields, 2, 2)?.bytes);
+      if (st != null && at != null) {
+        transitions[st] = at;
+      }
+    }
+  }
+
+  return { createdAtMs, toolName, transitions };
+}
+
+/**
+ * Estimate live partial output bytes from an in-progress `PLANNER_RESPONSE`
+ * `step_payload` (`f20`: `f1`/`f2` content, `f3` thinking, `f7` tool calls).
+ */
+function estimatePlannerPayloadBytes(payloadBuf) {
+  if (!payloadBuf) return { thinkingBytes: 0, responseBytes: 0, totalBytes: 0 };
+  const top = parseFields(payloadBuf);
+  const f20 = findField(top, 20, 2);
+  if (!f20) return { thinkingBytes: 0, responseBytes: 0, totalBytes: 0 };
+  const sub = parseFields(f20.bytes);
+  if (!sub) return { thinkingBytes: 0, responseBytes: 0, totalBytes: 0 };
+
+  let thinkingBytes = 0;
+  let responseBytes = 0;
+  for (const x of sub) {
+    if (x.wireType !== 2) continue;
+    if (x.field === 3) {
+      thinkingBytes += x.bytes.length;
+    } else if (x.field === 1 || x.field === 2 || x.field === 7 || x.field === 8) {
+      responseBytes += x.bytes.length;
+    }
+  }
+  return {
+    thinkingBytes,
+    responseBytes,
+    totalBytes: thinkingBytes + responseBytes,
+  };
 }
 
 /**
@@ -227,21 +287,82 @@ export function readConversationSqlite(dbPath) {
       .all();
 
     const stepMap = new Map();
-    let latestStep = null;
+    const toolEvents = [];
+    let activePlannerStep = null;
+    const activeToolSteps = [];
+
     for (const sr of stepRows) {
+      const meta = parseStepMetadata(sr.metadata);
       const info = {
         idx: sr.idx,
         stepType: sr.step_type,
         status: sr.status,
-        createdAtMs: parseStepCreatedAtMs(sr.metadata),
+        createdAtMs: meta.createdAtMs,
+        toolName: meta.toolName,
+        transitions: meta.transitions,
       };
       stepMap.set(sr.idx, info);
-      latestStep = info;
+
+      if (sr.step_type === STEP_TYPE_PLANNER_RESPONSE && ACTIVE_STATUSES.has(sr.status)) {
+        activePlannerStep = info;
+      }
+
+      if (sr.step_type === STEP_TYPE_TOOL || meta.toolName) {
+        const startedAtMs = meta.transitions[STEP_STATUS_RUNNING] ?? meta.createdAtMs;
+        const finishedAtMs =
+          meta.transitions[STEP_STATUS_DONE] ?? meta.transitions[STEP_STATUS_ERROR] ?? null;
+        const isRunning = sr.status === STEP_STATUS_PENDING || sr.status === STEP_STATUS_RUNNING;
+        const isError = sr.status === STEP_STATUS_ERROR;
+        const durationSec =
+          !isRunning && startedAtMs != null && finishedAtMs != null && finishedAtMs >= startedAtMs
+            ? (finishedAtMs - startedAtMs) / 1000
+            : null;
+
+        const evt = {
+          stepIndex: sr.idx,
+          name: meta.toolName || 'tool',
+          status: sr.status,
+          isRunning,
+          isError,
+          startedAtMs,
+          finishedAtMs,
+          durationSec,
+        };
+        toolEvents.push(evt);
+        if (isRunning) activeToolSteps.push(evt);
+      }
     }
 
+    // Determine live activity & inspect live planner payload only when actively streaming
     let activity = 'idle';
-    if (latestStep && (latestStep.status === STEP_STATUS_PENDING || latestStep.status === STEP_STATUS_RUNNING)) {
-      activity = latestStep.stepType === STEP_TYPE_PLANNER_RESPONSE ? 'streaming' : 'tool_running';
+    let liveTurn = null;
+
+    if (activePlannerStep) {
+      const isStreaming = activePlannerStep.status === STEP_STATUS_GENERATING;
+      activity = isStreaming ? 'streaming' : 'waiting_ttft';
+      const streamingStartedAtMs = activePlannerStep.transitions[STEP_STATUS_GENERATING] ?? null;
+
+      let partialBytes = { thinkingBytes: 0, responseBytes: 0, totalBytes: 0 };
+      if (isStreaming) {
+        const payloadRow = db
+          .prepare('SELECT step_payload FROM steps WHERE idx = ?')
+          .get(activePlannerStep.idx);
+        if (payloadRow?.step_payload) {
+          partialBytes = estimatePlannerPayloadBytes(payloadRow.step_payload);
+        }
+      }
+
+      liveTurn = {
+        stepIndex: activePlannerStep.idx,
+        phase: activity,
+        startedAtMs: activePlannerStep.createdAtMs,
+        streamingStartedAtMs,
+        thinkingBytes: partialBytes.thinkingBytes,
+        responseBytes: partialBytes.responseBytes,
+        totalBytes: partialBytes.totalBytes,
+      };
+    } else if (activeToolSteps.length > 0) {
+      activity = 'tool_running';
     }
 
     const gmRows = db
@@ -262,13 +383,16 @@ export function readConversationSqlite(dbPath) {
       const primaryStepIdx = parsed.stepIndices[0];
       const primaryStep = primaryStepIdx !== undefined ? stepMap.get(primaryStepIdx) : null;
 
-      // Count associated tool/execution steps (everything in stepIndices after planner step).
       let toolCount = 0;
       let hasError = false;
       for (const sIdx of parsed.stepIndices) {
         const s = stepMap.get(sIdx);
         if (s?.status === STEP_STATUS_ERROR) hasError = true;
-        if (sIdx !== primaryStepIdx && s?.stepType !== STEP_TYPE_USER_INPUT && s?.stepType !== STEP_TYPE_PLANNER_RESPONSE) {
+        if (
+          sIdx !== primaryStepIdx &&
+          s?.stepType !== STEP_TYPE_USER_INPUT &&
+          s?.stepType !== STEP_TYPE_PLANNER_RESPONSE
+        ) {
           toolCount++;
         }
       }
@@ -303,6 +427,8 @@ export function readConversationSqlite(dbPath) {
       source: 'sqlite',
       tpsPrecision: 'decode',
       activity,
+      liveTurn,
+      toolEvents,
       totalSteps: stepRows.length,
       detectedContextLimit,
       promptSnapshot: latestSnapshot,

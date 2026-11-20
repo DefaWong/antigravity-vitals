@@ -77,8 +77,18 @@ function makeGenMetadataBlob({
   ]);
 }
 
-function makeStepMeta(tsMs) {
-  return encodeMessage([fieldBytes(1, encodeTimestampMs(tsMs))]);
+function makeStepMeta(tsMs, opts = {}) {
+  const parts = [fieldBytes(1, encodeTimestampMs(tsMs))];
+  if (opts.toolName) {
+    parts.push(fieldBytes(4, encodeMessage([fieldString(1, 'call_1'), fieldString(2, opts.toolName)])));
+  }
+  if (opts.transitions?.length) {
+    const trParts = opts.transitions.map(([st, at]) =>
+      fieldBytes(1, encodeMessage([fieldVarint(1, st), fieldBytes(2, encodeTimestampMs(at))]))
+    );
+    parts.push(fieldBytes(26, encodeMessage(trParts)));
+  }
+  return encodeMessage(parts);
 }
 
 describe('data-dir and readers', () => {
@@ -124,19 +134,61 @@ describe('data-dir and readers', () => {
       const db = new DatabaseSync(dbPath);
       db.exec(`
         PRAGMA journal_mode = WAL;
-        CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER, metadata BLOB);
+        CREATE TABLE steps (idx INTEGER PRIMARY KEY, step_type INTEGER, status INTEGER, metadata BLOB, step_payload BLOB);
         CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB, size INTEGER DEFAULT 0);
       `);
 
       const t0 = Date.parse('2026-11-20T13:10:00.000Z');
       const t1 = Date.parse('2026-11-20T13:10:15.500Z');
 
-      const insStep = db.prepare('INSERT INTO steps (idx, step_type, status, metadata) VALUES (?, ?, ?, ?)');
-      insStep.run(0, 14, 3, makeStepMeta(t0));
-      insStep.run(1, 15, 3, makeStepMeta(t0 + 20));
-      insStep.run(2, 132, 3, makeStepMeta(t0 + 4000));
-      insStep.run(3, 132, 3, makeStepMeta(t0 + 4100));
-      insStep.run(4, 15, 2, makeStepMeta(t1)); // active streaming step!
+      const insStep = db.prepare(
+        'INSERT INTO steps (idx, step_type, status, metadata, step_payload) VALUES (?, ?, ?, ?, ?)'
+      );
+      insStep.run(0, 14, 3, makeStepMeta(t0), null);
+      insStep.run(1, 15, 3, makeStepMeta(t0 + 20), null);
+      insStep.run(
+        2,
+        132,
+        3,
+        makeStepMeta(t0 + 4000, {
+          toolName: 'run_command',
+          transitions: [
+            [2, t0 + 4050],
+            [3, t0 + 5250],
+          ],
+        }),
+        null
+      );
+      insStep.run(
+        3,
+        132,
+        7,
+        makeStepMeta(t0 + 4100, {
+          toolName: 'read_file',
+          transitions: [
+            [2, t0 + 4110],
+            [7, t0 + 4310],
+          ],
+        }),
+        null
+      );
+      // Active streaming planner step (status = 8 GENERATING) with partial payload!
+      const partialPayload = encodeMessage([
+        fieldBytes(
+          20,
+          encodeMessage([
+            fieldString(3, 'thinking... '.repeat(40)),
+            fieldString(1, 'streaming output '.repeat(50)),
+          ])
+        ),
+      ]);
+      insStep.run(
+        4,
+        15,
+        8,
+        makeStepMeta(t1, { transitions: [[8, t1 + 1200]] }),
+        partialPayload
+      );
 
       const insGm = db.prepare('INSERT INTO gen_metadata (idx, data) VALUES (?, ?)');
       insGm.run(
@@ -175,6 +227,15 @@ describe('data-dir and readers', () => {
       assert.equal(res.source, 'sqlite');
       assert.equal(res.tpsPrecision, 'decode');
       assert.equal(res.activity, 'streaming');
+      assert.ok(res.liveTurn);
+      assert.equal(res.liveTurn.phase, 'streaming');
+      assert.equal(res.liveTurn.streamingStartedAtMs, t1 + 1200);
+      assert.ok(res.liveTurn.totalBytes > 1000);
+      assert.equal(res.toolEvents.length, 2);
+      assert.equal(res.toolEvents[0].name, 'run_command');
+      assert.ok(Math.abs(res.toolEvents[0].durationSec - 1.2) < 0.01);
+      assert.equal(res.toolEvents[1].name, 'read_file');
+      assert.equal(res.toolEvents[1].isError, true);
       assert.equal(res.detectedContextLimit, 512000);
       assert.equal(res.turns.length, 2);
 

@@ -4,8 +4,8 @@ import { readFileSync } from 'node:fs';
  * Fallback telemetry reader using `<appData>/brain/<id>/.system_generated/logs/transcript.jsonl`.
  *
  * Used automatically whenever the SQLite DB is absent, locked, or changes schema.
- * Token counts, cache hit rate, and context size remain exact; TPS degrades
- * gracefully to end-to-end duration inferred from consecutive step timestamps.
+ * Token counts, cache hit rate, context size, and tool counts remain accurate;
+ * TPS degrades gracefully to end-to-end duration inferred from step timestamps.
  */
 export function readConversationTranscript(transcriptPath) {
   try {
@@ -25,6 +25,8 @@ export function readConversationTranscript(transcriptPath) {
     }
 
     const turns = [];
+    const toolEvents = [];
+
     for (let i = 0; i < steps.length; i++) {
       const s = steps[i];
       if (s.type !== 'PLANNER_RESPONSE') continue;
@@ -36,13 +38,29 @@ export function readConversationTranscript(transcriptPath) {
       let e2eSec = null;
       if (Number.isFinite(createdMs) && Number.isFinite(nextMs) && nextMs >= createdMs) {
         const delta = (nextMs - createdMs) / 1000;
-        // Guard against idle gaps when next step is a later user message.
         if (nextStep?.type !== 'USER_INPUT' && delta > 0 && delta < 600) {
           e2eSec = delta;
         }
       }
 
-      const tools = Array.isArray(s.tool_calls) ? s.tool_calls.length : 0;
+      const toolCalls = Array.isArray(s.tool_calls) ? s.tool_calls : [];
+      for (let tIdx = 0; tIdx < toolCalls.length; tIdx++) {
+        const tc = toolCalls[tIdx];
+        const resultStep = steps[i + 1 + tIdx];
+        const isError = resultStep?.status === 'ERROR';
+        const isRunning = resultStep?.status === 'RUNNING' || resultStep?.status === 'PENDING';
+        toolEvents.push({
+          stepIndex: resultStep?.step_index ?? s.step_index ?? null,
+          name: typeof tc?.name === 'string' && tc.name ? tc.name : 'tool',
+          status: isRunning ? 2 : isError ? 7 : 3,
+          isRunning,
+          isError,
+          startedAtMs: Number.isFinite(createdMs) ? createdMs : null,
+          finishedAtMs: null,
+          durationSec: null,
+        });
+      }
+
       const out = Math.max(0, Number(s.output_tokens) || 0);
 
       turns.push({
@@ -50,8 +68,8 @@ export function readConversationTranscript(transcriptPath) {
         genIdx: turns.length,
         stepIndex: typeof s.step_index === 'number' ? s.step_index : null,
         timestampMs: Number.isFinite(createdMs) ? createdMs : null,
-        kind: tools > 0 ? 'tool' : 'reply',
-        tools,
+        kind: toolCalls.length > 0 ? 'tool' : 'reply',
+        tools: toolCalls.length,
         hasError: s.status === 'ERROR',
         modelId: typeof s.model === 'string' ? s.model : '',
         modelDisplay: typeof s.model === 'string' ? s.model : '',
@@ -69,7 +87,7 @@ export function readConversationTranscript(transcriptPath) {
 
     const lastStep = steps[steps.length - 1];
     const activity =
-      lastStep && (lastStep.status === 'RUNNING' || lastStep.status === 'PENDING')
+      lastStep && (lastStep.status === 'RUNNING' || lastStep.status === 'PENDING' || lastStep.status === 'GENERATING')
         ? lastStep.type === 'PLANNER_RESPONSE'
           ? 'streaming'
           : 'tool_running'
@@ -80,6 +98,8 @@ export function readConversationTranscript(transcriptPath) {
       source: 'transcript',
       tpsPrecision: 'e2e_fallback',
       activity,
+      liveTurn: null,
+      toolEvents,
       totalSteps: steps.length,
       detectedContextLimit: 0,
       promptSnapshot: null,
