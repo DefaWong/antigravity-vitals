@@ -7,7 +7,7 @@ A zero-dependency, native **Antigravity 2.0 Sidecar UI plugin** mounted in the r
 - **Tool Hotspots & Live Active Tools**: Tracks per-tool call counts, error counts, cumulative durations, and highlights currently running tools with live elapsed timers.
 - **Prompt Cache Hit Rate & Drop Alerts**: Tracks cumulative & per-turn cache hit ratio, Warm vs. Cold TTFT comparison, and alerts immediately when a warm session suffers a sudden cache drop.
 - **Context Utilization & Real Breakdown**: Reads the exact model context limit and message/section/tool token snapshot from `gen_metadata` to render a 100-cell context matrix and per-category breakdown.
-- **Automatic Fallback & Native Theming**: Automatically falls back to `transcript.jsonl` if SQLite is unavailable, and mirrors Antigravity's light/dark CSS tokens via `/preload.js` with zero external CDN dependencies.
+- **Automatic Fallback, Native Theming & Bilingual UI (ZH / EN)**: Automatically falls back to `transcript.jsonl` if SQLite is unavailable, mirrors Antigravity's light/dark CSS tokens via `/preload.js`, auto-detects Chinese/English from the host/system locale (with one-click toggle), and suspends all polling when the pane is hidden (0% background CPU).
 
 ---
 
@@ -19,12 +19,12 @@ Zero build step and zero `npm install` required (uses Antigravity's embedded Nod
 
 **macOS / Linux:**
 ```bash
-git clone https://github.com/DefaWong/antigravity-vital.git ~/.gemini/config/plugins/antigravity-vital
+git clone https://github.com/DefaWong/antigravity-vitals.git ~/.gemini/config/plugins/antigravity-vitals
 ```
 
 **Windows (PowerShell):**
 ```powershell
-git clone https://github.com/DefaWong/antigravity-vital.git "$env:USERPROFILE\.gemini\config\plugins\antigravity-vital"
+git clone https://github.com/DefaWong/antigravity-vitals.git "$env:USERPROFILE\.gemini\config\plugins\antigravity-vitals"
 ```
 
 Antigravity automatically discovers and enables the plugin under **Customizations → Plugins → Vitals** — open the right-hand Auxiliary Pane to view it immediately.
@@ -41,10 +41,10 @@ If you already cloned the repo elsewhere and want edits to reflect directly:
 
 ```bash
 # Update (then toggle Vitals off & on once in Customizations to reload backend)
-git -C ~/.gemini/config/plugins/antigravity-vital pull
+git -C ~/.gemini/config/plugins/antigravity-vitals pull
 
 # Uninstall
-rm -rf ~/.gemini/config/plugins/antigravity-vital
+rm -rf ~/.gemini/config/plugins/antigravity-vitals
 ```
 
 ---
