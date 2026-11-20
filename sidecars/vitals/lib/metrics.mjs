@@ -410,8 +410,8 @@ export function computeVitals(conversationId, rawData) {
       latestWindowSegments: {
         cacheRead: latest.cacheReadTokens,
         uncachedInput: latest.inputTokens + latest.cacheCreationTokens,
-        thinking: sumThinking,
-        response: sumResponse,
+        thinking: latest.thinkingTokens,
+        response: latest.responseTokens,
       },
     },
     turns,

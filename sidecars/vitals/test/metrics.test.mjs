@@ -106,6 +106,13 @@ describe('computeVitals metrics engine', () => {
     assert.equal(res.summary.warmCount, 2);
     assert.equal(res.summary.coldCount, 1);
 
+    // Window bar segments must sum identically to latestContextUsed (no double-counting prior turns)
+    const segs = res.summary.latestWindowSegments;
+    assert.equal(
+      segs.cacheRead + segs.uncachedInput + segs.thinking + segs.response,
+      res.summary.latestContextUsed
+    );
+
     // Exact breakdown matches latest context used (20000 + 271 = 20271)
     assert.equal(res.breakdown.mode, 'exact_snapshot');
     const breakdownSum = res.breakdown.categories.reduce((a, c) => a + c.tokens, 0);
