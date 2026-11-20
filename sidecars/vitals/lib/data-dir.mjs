@@ -102,7 +102,9 @@ export function fingerprintFiles({ dbPath, transcriptPath }) {
   if (dbPath) {
     const main = safeStat(dbPath);
     const wal = safeStat(`${dbPath}-wal`);
-    parts.push(`db:${main.mtimeMs}:${main.size}:${wal.mtimeMs}:${wal.size}`);
+    const walSize = wal.exists && wal.size > 0 ? wal.size : 0;
+    const walMtime = walSize > 0 ? wal.mtimeMs : 0;
+    parts.push(`db:${main.mtimeMs}:${main.size}:${walMtime}:${walSize}`);
   }
   if (transcriptPath) {
     const tr = safeStat(transcriptPath);
