@@ -202,7 +202,7 @@ export function parseGenMetadataRow(idx, dataBuf) {
 /**
  * Parse `steps.metadata` protobuf:
  * - `f1`: created_at Timestamp
- * - `f4`: tool_call (`f1`: id, `f2`: tool name, `f3`: arguments JSON)
+ * - `f4`: tool_call (`f1`: id, `f2`: tool name)
  * - `f26`: status_transitions (`f1` repeated -> `f1`: status, `f2`: Timestamp)
  */
 function parseStepMetadata(metadataBuf) {
@@ -271,99 +271,224 @@ function estimatePlannerPayloadBytes(payloadBuf) {
   };
 }
 
+function stepRowToParsed(sr) {
+  const meta = parseStepMetadata(sr.metadata);
+  const info = {
+    idx: sr.idx,
+    stepType: sr.step_type,
+    status: sr.status,
+    createdAtMs: meta.createdAtMs,
+    toolName: meta.toolName,
+    transitions: meta.transitions,
+  };
+
+  let toolEvent = null;
+  if (sr.step_type === STEP_TYPE_TOOL || meta.toolName) {
+    const startedAtMs = meta.transitions[STEP_STATUS_RUNNING] ?? meta.createdAtMs;
+    const finishedAtMs =
+      meta.transitions[STEP_STATUS_DONE] ?? meta.transitions[STEP_STATUS_ERROR] ?? null;
+    const isRunning = sr.status === STEP_STATUS_PENDING || sr.status === STEP_STATUS_RUNNING;
+    const isError = sr.status === STEP_STATUS_ERROR;
+    const durationSec =
+      !isRunning && startedAtMs != null && finishedAtMs != null && finishedAtMs >= startedAtMs
+        ? (finishedAtMs - startedAtMs) / 1000
+        : null;
+
+    toolEvent = {
+      stepIndex: sr.idx,
+      name: meta.toolName || 'tool',
+      status: sr.status,
+      isRunning,
+      isError,
+      startedAtMs,
+      finishedAtMs,
+      durationSec,
+    };
+  }
+
+  return { info, toolEvent };
+}
+
+function buildLiveActivity(db, activePlannerStep, activeToolSteps) {
+  let activity = 'idle';
+  let liveTurn = null;
+
+  if (activePlannerStep) {
+    const isStreaming = activePlannerStep.status === STEP_STATUS_GENERATING;
+    activity = isStreaming ? 'streaming' : 'waiting_ttft';
+    const streamingStartedAtMs = activePlannerStep.transitions[STEP_STATUS_GENERATING] ?? null;
+
+    let partialBytes = { thinkingBytes: 0, responseBytes: 0, totalBytes: 0 };
+    if (isStreaming) {
+      const payloadRow = db
+        .prepare('SELECT step_payload FROM steps WHERE idx = ?')
+        .get(activePlannerStep.idx);
+      if (payloadRow?.step_payload) {
+        partialBytes = estimatePlannerPayloadBytes(payloadRow.step_payload);
+      }
+    }
+
+    liveTurn = {
+      stepIndex: activePlannerStep.idx,
+      phase: activity,
+      startedAtMs: activePlannerStep.createdAtMs,
+      streamingStartedAtMs,
+      thinkingBytes: partialBytes.thinkingBytes,
+      responseBytes: partialBytes.responseBytes,
+      totalBytes: partialBytes.totalBytes,
+    };
+  } else if (activeToolSteps.length > 0) {
+    activity = 'tool_running';
+  }
+
+  return { activity, liveTurn };
+}
+
 /**
  * Read conversation telemetry from local Antigravity SQLite DB (Option A).
- * Opens read-only, runs fast indexed queries, and closes immediately so WAL
- * checkpoints in Antigravity are never obstructed.
+ *
+ * When `prevCache` is supplied and `gen_metadata` row count / max idx have not
+ * changed (e.g. during active streaming or tool execution), skips re-reading
+ * historical `gen_metadata` blobs and completed `steps` prefix — querying only
+ * the live tail steps and the single active `step_payload` (< 0.3ms).
  */
-export function readConversationSqlite(dbPath) {
+export function readConversationSqlite(dbPath, prevCache = null) {
   let db;
   try {
     db = new DatabaseSync(dbPath, { readOnly: true });
     db.exec('PRAGMA busy_timeout = 500;');
 
+    const gmMeta = db
+      .prepare('SELECT COUNT(*) AS count, COALESCE(MAX(idx), -1) AS maxIdx FROM gen_metadata')
+      .get();
+    const stepMeta = db
+      .prepare('SELECT COUNT(*) AS count, COALESCE(MAX(idx), -1) AS maxIdx FROM steps')
+      .get();
+
+    const gmCount = gmMeta?.count || 0;
+    const gmMaxIdx = gmMeta?.maxIdx ?? -1;
+    const totalSteps = stepMeta?.count || 0;
+
+    // Fast incremental path: gen_metadata unchanged & DB did not shrink
+    const canIncremental =
+      Boolean(prevCache) &&
+      prevCache.gmCount === gmCount &&
+      prevCache.gmMaxIdx === gmMaxIdx &&
+      totalSteps >= prevCache.stableStepCount;
+
+    if (canIncremental) {
+      const tailRows = db
+        .prepare('SELECT idx, step_type, status, metadata FROM steps WHERE idx >= ? ORDER BY idx ASC')
+        .all(prevCache.tailStartIdx);
+
+      const tailToolEvents = [];
+      let activePlannerStep = null;
+      const activeToolSteps = [];
+      let nextTailStartIdx = prevCache.tailStartIdx;
+      let stableLocked = false;
+      const newlyStableToolEvents = [];
+      let newlyStableCount = 0;
+
+      for (const sr of tailRows) {
+        const { info, toolEvent } = stepRowToParsed(sr);
+        const isActive = ACTIVE_STATUSES.has(sr.status);
+
+        if (sr.step_type === STEP_TYPE_PLANNER_RESPONSE && isActive) {
+          activePlannerStep = info;
+        }
+        if (toolEvent) {
+          if (toolEvent.isRunning) activeToolSteps.push(toolEvent);
+          tailToolEvents.push(toolEvent);
+        }
+
+        if (!stableLocked) {
+          if (isActive) {
+            stableLocked = true;
+          } else {
+            nextTailStartIdx = sr.idx + 1;
+            newlyStableCount++;
+            if (toolEvent) newlyStableToolEvents.push(toolEvent);
+          }
+        }
+      }
+
+      const { activity, liveTurn } = buildLiveActivity(db, activePlannerStep, activeToolSteps);
+      const toolEvents =
+        prevCache.stableToolEvents.length > 0
+          ? prevCache.stableToolEvents.concat(tailToolEvents)
+          : tailToolEvents;
+
+      const nextCache = {
+        gmCount,
+        gmMaxIdx,
+        stableStepCount: prevCache.stableStepCount + newlyStableCount,
+        tailStartIdx: nextTailStartIdx,
+        stableToolEvents:
+          newlyStableToolEvents.length > 0
+            ? prevCache.stableToolEvents.concat(newlyStableToolEvents)
+            : prevCache.stableToolEvents,
+        detectedContextLimit: prevCache.detectedContextLimit,
+        promptSnapshot: prevCache.promptSnapshot,
+        turns: prevCache.turns,
+      };
+
+      return {
+        ok: true,
+        source: 'sqlite',
+        tpsPrecision: 'decode',
+        fastPath: true,
+        gmCount,
+        gmMaxIdx,
+        activity,
+        liveTurn,
+        toolEvents,
+        totalSteps,
+        detectedContextLimit: prevCache.detectedContextLimit,
+        promptSnapshot: prevCache.promptSnapshot,
+        turns: prevCache.turns,
+        _readerCache: nextCache,
+      };
+    }
+
+    // Full read path (first load or after gen_metadata added a new completed turn)
     const stepRows = db
       .prepare('SELECT idx, step_type, status, metadata FROM steps ORDER BY idx ASC')
       .all();
 
     const stepMap = new Map();
     const toolEvents = [];
+    const stableToolEvents = [];
     let activePlannerStep = null;
     const activeToolSteps = [];
+    let tailStartIdx = 0;
+    let stableStepCount = 0;
+    let stableLocked = false;
 
     for (const sr of stepRows) {
-      const meta = parseStepMetadata(sr.metadata);
-      const info = {
-        idx: sr.idx,
-        stepType: sr.step_type,
-        status: sr.status,
-        createdAtMs: meta.createdAtMs,
-        toolName: meta.toolName,
-        transitions: meta.transitions,
-      };
+      const { info, toolEvent } = stepRowToParsed(sr);
       stepMap.set(sr.idx, info);
 
-      if (sr.step_type === STEP_TYPE_PLANNER_RESPONSE && ACTIVE_STATUSES.has(sr.status)) {
+      const isActive = ACTIVE_STATUSES.has(sr.status);
+      if (sr.step_type === STEP_TYPE_PLANNER_RESPONSE && isActive) {
         activePlannerStep = info;
       }
-
-      if (sr.step_type === STEP_TYPE_TOOL || meta.toolName) {
-        const startedAtMs = meta.transitions[STEP_STATUS_RUNNING] ?? meta.createdAtMs;
-        const finishedAtMs =
-          meta.transitions[STEP_STATUS_DONE] ?? meta.transitions[STEP_STATUS_ERROR] ?? null;
-        const isRunning = sr.status === STEP_STATUS_PENDING || sr.status === STEP_STATUS_RUNNING;
-        const isError = sr.status === STEP_STATUS_ERROR;
-        const durationSec =
-          !isRunning && startedAtMs != null && finishedAtMs != null && finishedAtMs >= startedAtMs
-            ? (finishedAtMs - startedAtMs) / 1000
-            : null;
-
-        const evt = {
-          stepIndex: sr.idx,
-          name: meta.toolName || 'tool',
-          status: sr.status,
-          isRunning,
-          isError,
-          startedAtMs,
-          finishedAtMs,
-          durationSec,
-        };
-        toolEvents.push(evt);
-        if (isRunning) activeToolSteps.push(evt);
+      if (toolEvent) {
+        toolEvents.push(toolEvent);
+        if (toolEvent.isRunning) activeToolSteps.push(toolEvent);
       }
-    }
 
-    // Determine live activity & inspect live planner payload only when actively streaming
-    let activity = 'idle';
-    let liveTurn = null;
-
-    if (activePlannerStep) {
-      const isStreaming = activePlannerStep.status === STEP_STATUS_GENERATING;
-      activity = isStreaming ? 'streaming' : 'waiting_ttft';
-      const streamingStartedAtMs = activePlannerStep.transitions[STEP_STATUS_GENERATING] ?? null;
-
-      let partialBytes = { thinkingBytes: 0, responseBytes: 0, totalBytes: 0 };
-      if (isStreaming) {
-        const payloadRow = db
-          .prepare('SELECT step_payload FROM steps WHERE idx = ?')
-          .get(activePlannerStep.idx);
-        if (payloadRow?.step_payload) {
-          partialBytes = estimatePlannerPayloadBytes(payloadRow.step_payload);
+      if (!stableLocked) {
+        if (isActive) {
+          stableLocked = true;
+        } else {
+          tailStartIdx = sr.idx + 1;
+          stableStepCount++;
+          if (toolEvent) stableToolEvents.push(toolEvent);
         }
       }
-
-      liveTurn = {
-        stepIndex: activePlannerStep.idx,
-        phase: activity,
-        startedAtMs: activePlannerStep.createdAtMs,
-        streamingStartedAtMs,
-        thinkingBytes: partialBytes.thinkingBytes,
-        responseBytes: partialBytes.responseBytes,
-        totalBytes: partialBytes.totalBytes,
-      };
-    } else if (activeToolSteps.length > 0) {
-      activity = 'tool_running';
     }
+
+    const { activity, liveTurn } = buildLiveActivity(db, activePlannerStep, activeToolSteps);
 
     const gmRows = db
       .prepare('SELECT idx, data FROM gen_metadata ORDER BY idx ASC')
@@ -422,17 +547,32 @@ export function readConversationSqlite(dbPath) {
       });
     }
 
+    const nextCache = {
+      gmCount,
+      gmMaxIdx,
+      stableStepCount,
+      tailStartIdx,
+      stableToolEvents,
+      detectedContextLimit,
+      promptSnapshot: latestSnapshot,
+      turns,
+    };
+
     return {
       ok: true,
       source: 'sqlite',
       tpsPrecision: 'decode',
+      fastPath: false,
+      gmCount,
+      gmMaxIdx,
       activity,
       liveTurn,
       toolEvents,
-      totalSteps: stepRows.length,
+      totalSteps,
       detectedContextLimit,
       promptSnapshot: latestSnapshot,
       turns,
+      _readerCache: nextCache,
     };
   } catch (err) {
     return {

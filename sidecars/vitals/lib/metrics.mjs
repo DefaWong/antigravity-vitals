@@ -498,9 +498,16 @@ export function computeVitals(conversationId, rawData, nowMs = Date.now()) {
 
   const breakdown = buildBreakdown(latest, rawData?.promptSnapshot || null, contextLimit);
 
+  const historyRev = `${source}:${turns.length}:${rawData?.gmMaxIdx ?? turns.length}`;
+  const toolsRev = `${toolStats.totalCalls}:${toolStats.errorCalls}:${toolStats.totalDurationSec}:${toolStats.activeTools
+    .map((t) => `${t.stepIndex}:${t.name}`)
+    .join(',')}`;
+
   return {
     conversationId,
     serverNowMs: nowMs,
+    historyRev,
+    toolsRev,
     hasData: true,
     source,
     tpsPrecision,

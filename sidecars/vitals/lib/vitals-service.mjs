@@ -7,15 +7,16 @@ const MAX_CACHE_ENTRIES = 64;
 
 /**
  * Stateful, ETag-cached telemetry service combining Option A (SQLite `gen_metadata`
- * + live `steps`) with automatic fallback to `transcript.jsonl`.
+ * + incremental live `steps` fast-path) with automatic fallback to `transcript.jsonl`.
  *
- * When a conversation is actively streaming (`waiting_ttft` / `streaming` /
- * `tool_running`), the service bypasses idle ETag caching so sub-second polls
- * pick up live WAL commits and partial output growth immediately.
+ * - Idle conversations: 0 SQLite opens (48-byte `-shm` WAL header fingerprint).
+ * - Active streaming / tool execution: incremental fast-path skips historical
+ *   `gen_metadata` blobs and completed `steps` prefix, reading only tail steps
+ *   and the single active `step_payload` (< 0.3ms).
  */
 export function createVitalsService(options = {}) {
   const getAppDataDirs = options.getAppDataDirs || (() => findAppDataDirs());
-  const cache = new Map(); // convId -> { etag, payload }
+  const cache = new Map(); // convId -> { etag, payload, readerCache, dbPath }
 
   function setCache(convId, entry) {
     if (cache.has(convId)) cache.delete(convId);
@@ -57,13 +58,16 @@ export function createVitalsService(options = {}) {
 
     let rawData = null;
     let sqliteError = null;
+    let readerCache = cached?.dbPath === files.dbPath ? cached?.readerCache || null : null;
 
     if (files.dbPath) {
-      const sqlRes = readConversationSqlite(files.dbPath);
+      const sqlRes = readConversationSqlite(files.dbPath, readerCache);
       if (sqlRes.ok && (sqlRes.turns.length > 0 || sqlRes.activity !== 'idle' || !files.transcriptPath)) {
         rawData = sqlRes;
+        readerCache = sqlRes._readerCache || null;
       } else if (!sqlRes.ok) {
         sqliteError = sqlRes.error;
+        readerCache = null;
       }
     }
 
@@ -85,7 +89,34 @@ export function createVitalsService(options = {}) {
     }
 
     const nowMs = Date.now();
-    const payload = computeVitals(conv, rawData, nowMs);
+    let payload;
+    // If incremental fast-path kept historical turns/breakdown identical, we still
+    // compute fresh liveTurn & toolStats cleanly while avoiding duplicate work if needed.
+    if (
+      rawData.fastPath &&
+      cached?.payload?.hasData &&
+      cached.payload.source === 'sqlite' &&
+      cached.payload.turns?.length === rawData.turns.length
+    ) {
+      // Reuse heavy breakdown + turns from cached payload; refresh only liveTurn/toolStats/activity!
+      const freshLive = computeVitals(conv, {
+        ...rawData,
+        turns: [], // skip recomputing turns/breakdown!
+      }, nowMs);
+      payload = {
+        ...cached.payload,
+        serverNowMs: nowMs,
+        activity: freshLive.activity,
+        liveTurn: freshLive.liveTurn,
+        toolStats: freshLive.toolStats,
+        toolsRev: `${freshLive.toolStats.totalCalls}:${freshLive.toolStats.errorCalls}:${freshLive.toolStats.totalDurationSec}:${freshLive.toolStats.activeTools
+          .map((t) => `${t.stepIndex}:${t.name}`)
+          .join(',')}`,
+      };
+    } else {
+      payload = computeVitals(conv, rawData, nowMs);
+    }
+
     if (sqliteError && payload.source !== 'sqlite') {
       payload.fallbackReason = sqliteError;
     }
@@ -94,8 +125,8 @@ export function createVitalsService(options = {}) {
     const isActive = payload.activity !== 'idle';
     const etag = isActive ? `${conv}|live|${nowMs}` : `${conv}|${finalFp}`;
 
-    setCache(conv, { etag, payload });
-    return { ...payload, etag };
+    setCache(conv, { etag, payload, readerCache, dbPath: files.dbPath });
+    return { ...payload, etag, fastPath: Boolean(rawData.fastPath) };
   }
 
   return {

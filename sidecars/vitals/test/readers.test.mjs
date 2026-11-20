@@ -224,6 +224,7 @@ describe('data-dir and readers', () => {
 
       const res = readConversationSqlite(dbPath);
       assert.equal(res.ok, true);
+      assert.equal(res.fastPath, false);
       assert.equal(res.source, 'sqlite');
       assert.equal(res.tpsPrecision, 'decode');
       assert.equal(res.activity, 'streaming');
@@ -238,6 +239,28 @@ describe('data-dir and readers', () => {
       assert.equal(res.toolEvents[1].isError, true);
       assert.equal(res.detectedContextLimit, 512000);
       assert.equal(res.turns.length, 2);
+
+      // Incremental fast-path: update streaming step_payload without touching gen_metadata
+      const db2 = new DatabaseSync(dbPath);
+      const biggerPayload = encodeMessage([
+        fieldBytes(
+          20,
+          encodeMessage([
+            fieldString(3, 'thinking... '.repeat(80)),
+            fieldString(1, 'streaming output '.repeat(120)),
+          ])
+        ),
+      ]);
+      db2.prepare('UPDATE steps SET step_payload = ? WHERE idx = 4').run(biggerPayload);
+      db2.close();
+
+      const inc = readConversationSqlite(dbPath, res._readerCache);
+      assert.equal(inc.ok, true);
+      assert.equal(inc.fastPath, true);
+      assert.equal(inc.activity, 'streaming');
+      assert.ok(inc.liveTurn.totalBytes > res.liveTurn.totalBytes);
+      assert.equal(inc.turns.length, 2);
+      assert.equal(inc.toolEvents.length, 2);
 
       assert.equal(res.turns[0].kind, 'tool');
       assert.equal(res.turns[0].tools, 2);
