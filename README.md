@@ -2,31 +2,61 @@
 
 A zero-dependency, native **Antigravity 2.0 Sidecar UI plugin** mounted in the right-hand Auxiliary Pane (`SIDECAR_UI_ENTRYPOINT_AUX_PANE`) for live conversation telemetry:
 
-- **Pure Decode TPS & E2E TPS**: Reads millisecond `time_to_first_token` (TTFT) and `streaming_duration` directly from Antigravity's local SQLite `gen_metadata` protobuf blobs via Node's built-in `node:sqlite`, using time-weighted ratio-of-sums averages and buffered single-chunk burst protection.
-- **Warm vs. Cold TTFT**: Splits cached hits vs. cold prefills and reports exact cache speedup ratio.
-- **Prompt Cache Hit Rate & Drop Alerts**: Tracks cumulative & per-turn cache hit ratio and alerts immediately when a warm session suffers a sudden cache drop.
-- **Context Utilization & Real Breakdown**: Reads the exact model context limit and message/section/tool token snapshot from `gen_metadata` to render a 100-cell context matrix and per-category breakdown (Tool Outputs, System Prompt/Skills/Rules, Assistant/Thinking, Tool/MCP Definitions, User Messages).
-- **Automatic Fallback**: If a conversation's SQLite DB is missing or its schema ever changes, automatically falls back to `transcript.jsonl` with exact tokens/cache and E2E TPS.
-- **Native Host Theming**: Syncs automatically with Antigravity's light/dark CSS tokens via `/preload.js` with zero external CDN dependencies.
+- **Pure Decode TPS & E2E TPS**: Reads millisecond `time_to_first_token` (TTFT) and `streaming_duration` directly from Antigravity's local SQLite `gen_metadata` protobuf blobs via Node's built-in `node:sqlite`, using time-weighted ratio-of-sums averages and short-sample noise filtering (`<1.5s` or `<300 tok`) to avoid first-chunk buffering spikes.
+- **Sub-Second Live Streaming Telemetry**: Monitors SQLite WAL-index (`-shm`) commit counters and in-progress `steps` (`status = 8` streaming / `status = 1,2` waiting TTFT or tool execution) at `350ms` active polling + `100ms` smooth client timers.
+- **Tool Hotspots & Live Active Tools**: Tracks per-tool call counts, error counts, cumulative durations, and highlights currently running tools with live elapsed timers.
+- **Prompt Cache Hit Rate & Drop Alerts**: Tracks cumulative & per-turn cache hit ratio, Warm vs. Cold TTFT comparison, and alerts immediately when a warm session suffers a sudden cache drop.
+- **Context Utilization & Real Breakdown**: Reads the exact model context limit and message/section/tool token snapshot from `gen_metadata` to render a 100-cell context matrix and per-category breakdown.
+- **Automatic Fallback & Native Theming**: Automatically falls back to `transcript.jsonl` if SQLite is unavailable, and mirrors Antigravity's light/dark CSS tokens via `/preload.js` with zero external CDN dependencies.
 
-## Install
+---
+
+## Install (for Users / Friends)
+
+Zero build step and zero `npm install` required (uses Antigravity's embedded Node >= 22.5 runtime).
+
+### Option 1: Direct Git Clone (Recommended)
+
+**macOS / Linux:**
+```bash
+git clone <YOUR_REPO_URL> ~/.gemini/config/plugins/antigravity-vital
+```
+
+**Windows (PowerShell):**
+```powershell
+git clone <YOUR_REPO_URL> "$env:USERPROFILE\.gemini\config\plugins\antigravity-vital"
+```
+
+Antigravity automatically discovers and enables the plugin under **Customizations → Plugins → Vitals** — open the right-hand Auxiliary Pane to view it immediately.
+
+### Option 2: Local Dev Symlink
+
+If you already cloned the repo elsewhere and want edits to reflect directly:
 
 ```bash
 ./scripts/install.sh
 ```
 
-This symlinks the repository into `~/.gemini/config/plugins/antigravity-vital`. Antigravity discovers it automatically without restarting.
+### Update / Uninstall
+
+```bash
+# Update (then toggle Vitals off & on once in Customizations to reload backend)
+git -C ~/.gemini/config/plugins/antigravity-vital pull
+
+# Uninstall
+rm -rf ~/.gemini/config/plugins/antigravity-vital
+```
+
+---
 
 ## Development & Tests
-
-Requires Node.js >= 22.5 (for built-in `node:sqlite` and `node:test`). Zero `npm install` needed.
 
 ```bash
 cd sidecars/vitals
 npm test
 ```
 
-Run standalone preview outside Antigravity:
+Standalone browser preview outside Antigravity:
 
 ```bash
 PORT=4321 node sidecars/vitals/main.mjs
@@ -45,14 +75,14 @@ antigravity-vital/
     ├── main.mjs                       # sidecar_sdk server + standalone HTTP shim
     ├── lib/
     │   ├── protobuf.mjs               # Zero-dependency protobuf wire reader
-    │   ├── data-dir.mjs               # App data dir resolver & WAL-aware ETag fingerprint
-    │   ├── sqlite-reader.mjs          # Option A: read-only node:sqlite gen_metadata reader
+    │   ├── data-dir.mjs               # App data dir resolver & WAL/SHM fingerprint
+    │   ├── sqlite-reader.mjs          # Option A: read-only SQLite gen_metadata + steps reader
     │   ├── transcript-reader.mjs      # Fallback: transcript.jsonl reader
-    │   ├── metrics.mjs                # Pure telemetry calculation engine
-    │   └── vitals-service.mjs         # ETag-cached telemetry facade
+    │   ├── metrics.mjs                # Pure telemetry & tool hotspot calculation engine
+    │   └── vitals-service.mjs         # ETag-cached telemetry facade (active bypass)
     ├── public/
     │   ├── index.html                 # Auxiliary pane layout (/preload.js bridge)
     │   ├── styles.css                 # Host-token-aware light/dark stylesheet
-    │   └── app.js                     # Polling, SVG charts, turns ledger & 100-cell matrix
+    │   └── app.js                     # 350ms live polling, 100ms ticker, SVG charts & UI
     └── test/                          # Unit & API integration tests (node:test)
 ```
