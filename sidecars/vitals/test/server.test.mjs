@@ -70,7 +70,7 @@ describe('vitals sidecar HTTP API', () => {
       assert.equal(healthRes.status, 200);
       const health = JSON.parse(healthRes.body);
       assert.equal(health.ok, true);
-      assert.equal(health.service, 'antigravity-vital');
+      assert.equal(health.service, 'antigravity-vitals');
 
       const firstRes = await app.dispatch('GET', `/api/vitals?conversationId=${convId}`);
       assert.equal(firstRes.status, 200);

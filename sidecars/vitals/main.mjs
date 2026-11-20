@@ -157,7 +157,7 @@ export function registerRoutes(app, ResponseCtor, service = createVitalsService(
     '/api/health',
     () => ({
       ok: true,
-      service: 'antigravity-vital',
+      service: 'antigravity-vitals',
       appDataDirs: service.getAppDataDirs(),
     }),
     'GET'

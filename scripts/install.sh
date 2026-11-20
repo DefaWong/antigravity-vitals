@@ -2,7 +2,7 @@
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PLUGIN_NAME="antigravity-vital"
+PLUGIN_NAME="antigravity-vitals"
 PLUGINS_DIR="${HOME}/.gemini/config/plugins"
 TARGET="${PLUGINS_DIR}/${PLUGIN_NAME}"
 

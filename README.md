@@ -66,7 +66,7 @@ PORT=4321 node sidecars/vitals/main.mjs
 ## Architecture
 
 ```text
-antigravity-vital/
+antigravity-vitals/
 ├── plugin.json                        # Antigravity plugin manifest
 ├── assets/logo.svg                    # Plugin icon
 ├── scripts/install.sh                 # Symlink installer to ~/.gemini/config/plugins/

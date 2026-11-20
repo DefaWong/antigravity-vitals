@@ -97,7 +97,7 @@ describe('data-dir and readers', () => {
     try {
       const appData = join(tmp, 'antigravity');
       const convId = '0c0859ce-44cc-467d-9cd3-3085a8ca855d';
-      const execDir = join(appData, 'sidecar_data', 'antigravity-vital', 'vitals', 'data');
+      const execDir = join(appData, 'sidecar_data', 'antigravity-vitals', 'vitals', 'data');
       mkdirSync(join(appData, 'conversations'), { recursive: true });
       mkdirSync(join(appData, 'brain', convId, '.system_generated', 'logs'), { recursive: true });
       mkdirSync(execDir, { recursive: true });
