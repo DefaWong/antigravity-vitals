@@ -2,6 +2,8 @@
   "name": "antigravity-vital",
   "displayName": "Vitals",
   "version": "0.1.0",
+  "author": "DefaWong",
+  "repository": "https://github.com/DefaWong/antigravity-vital",
   "description": "Live telemetry HUD for Antigravity's auxiliary pane: pure decode & E2E TPS, warm vs. cold TTFT, prompt cache hit rate, token totals, and context window breakdown.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [

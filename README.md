@@ -19,12 +19,12 @@ Zero build step and zero `npm install` required (uses Antigravity's embedded Nod
 
 **macOS / Linux:**
 ```bash
-git clone <YOUR_REPO_URL> ~/.gemini/config/plugins/antigravity-vital
+git clone https://github.com/DefaWong/antigravity-vital.git ~/.gemini/config/plugins/antigravity-vital
 ```
 
 **Windows (PowerShell):**
 ```powershell
-git clone <YOUR_REPO_URL> "$env:USERPROFILE\.gemini\config\plugins\antigravity-vital"
+git clone https://github.com/DefaWong/antigravity-vital.git "$env:USERPROFILE\.gemini\config\plugins\antigravity-vital"
 ```
 
 Antigravity automatically discovers and enables the plugin under **Customizations → Plugins → Vitals** — open the right-hand Auxiliary Pane to view it immediately.
