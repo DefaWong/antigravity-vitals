@@ -1,0 +1,14 @@
+{
+  "name": "antigravity-vital-sidecar",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Antigravity 2.0 native sidecar for live conversation telemetry (TPS, TTFT, cache hit rate, context breakdown)",
+  "scripts": {
+    "start": "node main.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  }
+}
