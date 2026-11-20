@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, statSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readdirSync, readSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 
@@ -94,8 +94,34 @@ export function locateConversationFiles(conversationId, appDataDirs) {
 }
 
 /**
+ * Read the first 48 bytes of SQLite's `-shm` WAL-index header (`WalIndexHdr`),
+ * which contains `iChange` (commit counter) and `mxFrame`. This catches every
+ * WAL commit instantly even when `-wal` file size and mtime stay unchanged
+ * after a passive checkpoint.
+ */
+function readShmHeaderHex(shmPath) {
+  let fd;
+  try {
+    fd = openSync(shmPath, 'r');
+    const buf = Buffer.alloc(48);
+    const n = readSync(fd, buf, 0, 48, 0);
+    return n > 0 ? buf.subarray(0, n).toString('hex') : '';
+  } catch {
+    return '';
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        // ignore
+      }
+    }
+  }
+}
+
+/**
  * Compute a lightweight fingerprint for a conversation's backing files,
- * including SQLite WAL sidecar files so live turns invalidate ETags immediately.
+ * including SQLite WAL & SHM commit headers so live turns invalidate ETags immediately.
  */
 export function fingerprintFiles({ dbPath, transcriptPath }) {
   const parts = [];
@@ -104,7 +130,8 @@ export function fingerprintFiles({ dbPath, transcriptPath }) {
     const wal = safeStat(`${dbPath}-wal`);
     const walSize = wal.exists && wal.size > 0 ? wal.size : 0;
     const walMtime = walSize > 0 ? wal.mtimeMs : 0;
-    parts.push(`db:${main.mtimeMs}:${main.size}:${walMtime}:${walSize}`);
+    const shmHex = walSize > 0 ? readShmHeaderHex(`${dbPath}-shm`) : '';
+    parts.push(`db:${main.mtimeMs}:${main.size}:${walMtime}:${walSize}:${shmHex}`);
   }
   if (transcriptPath) {
     const tr = safeStat(transcriptPath);

@@ -1,18 +1,25 @@
 /**
  * Pure telemetry computation engine for Antigravity Vitals.
  *
- * Computes per-turn and session-wide metrics from raw SQLite (`gen_metadata`)
- * or fallback `transcript.jsonl` payloads:
- * - Pure decode TPS (buffered single-chunk burst aware) & E2E TPS
- * - Time-weighted ratio-of-sums averages
+ * Computes per-turn and session-wide metrics from raw SQLite (`gen_metadata` +
+ * `steps`) or fallback `transcript.jsonl` payloads:
+ * - Pure decode TPS with short-sample noise filter (avoids first-chunk buffer inflation)
+ * - Time-weighted ratio-of-sums session averages
  * - Warm vs. cold TTFT & cache speedup
  * - Cache hit rate & mid-session cache-drop detection
  * - Exact context window utilization & role/section breakdown
+ * - Tool hotspots & real-time active tool/streaming telemetry
  */
 
-const BURST_MAX_SEC = 0.5;
-const BURST_SPEED_THRESHOLD = 450; // tok/s above this on <0.5s indicates single-chunk tool JSON flush
+// Gemini buffers the initial ~100-150 tokens (thinking summary / tool-call JSON)
+// before emitting the first streamed chunk (status=8). Dividing total output by
+// a short tail window (<1.5s or <300 tokens) artificially inflates decode TPS
+// to 250-1000+ tok/s. Such turns are marked `isShortSample` so steady-state
+// Decode TPS charts and averages stay physically accurate.
+const SHORT_SAMPLE_MIN_SEC = 1.5;
+const SHORT_SAMPLE_MIN_OUT = 300;
 const MIN_VALID_SEC = 0.05;
+const BYTES_PER_TOKEN_EST = 3.8;
 
 function inferDefaultContextLimit(modelStr = '') {
   const m = String(modelStr).toLowerCase();
@@ -23,8 +30,7 @@ function inferDefaultContextLimit(modelStr = '') {
 }
 
 /**
- * Normalize thinking vs. visible output tokens safely across providers
- * (handles both inclusive total output like Gemini and split output).
+ * Normalize thinking vs. visible output tokens safely across providers.
  */
 function normalizeOutput(raw) {
   const rawOut = Math.max(0, raw.outputTokens || 0);
@@ -45,7 +51,128 @@ function normalizeOutput(raw) {
 }
 
 /**
- * Build real context breakdown from the SQLite `promptSnapshot`, or an honest
+ * Aggregate tool call hotspots & currently running tools from `toolEvents`.
+ */
+function buildToolStats(toolEvents = [], nowMs = Date.now()) {
+  if (!Array.isArray(toolEvents) || toolEvents.length === 0) {
+    return {
+      totalCalls: 0,
+      errorCalls: 0,
+      uniqueTools: 0,
+      totalDurationSec: 0,
+      activeTools: [],
+      hotspots: [],
+    };
+  }
+
+  const byName = new Map();
+  const activeTools = [];
+  let totalCalls = 0;
+  let errorCalls = 0;
+  let totalDurationSec = 0;
+
+  for (const evt of toolEvents) {
+    const name = evt.name || 'tool';
+    totalCalls++;
+    if (evt.isError) errorCalls++;
+
+    let row = byName.get(name);
+    if (!row) {
+      row = { name, count: 0, errors: 0, totalDurationSec: 0, timedCount: 0, running: 0 };
+      byName.set(name, row);
+    }
+    row.count++;
+    if (evt.isError) row.errors++;
+
+    if (evt.isRunning) {
+      row.running++;
+      const elapsedSec =
+        evt.startedAtMs != null && nowMs >= evt.startedAtMs
+          ? Number(((nowMs - evt.startedAtMs) / 1000).toFixed(1))
+          : 0;
+      activeTools.push({
+        name,
+        stepIndex: evt.stepIndex ?? null,
+        startedAtMs: evt.startedAtMs ?? nowMs,
+        elapsedSec,
+      });
+    } else if (evt.durationSec != null && Number.isFinite(evt.durationSec) && evt.durationSec >= 0) {
+      row.totalDurationSec += evt.durationSec;
+      row.timedCount++;
+      totalDurationSec += evt.durationSec;
+    }
+  }
+
+  const hotspots = [...byName.values()]
+    .map((r) => ({
+      name: r.name,
+      count: r.count,
+      errors: r.errors,
+      running: r.running,
+      totalDurationSec: Number(r.totalDurationSec.toFixed(1)),
+      avgDurationSec: r.timedCount > 0 ? Number((r.totalDurationSec / r.timedCount).toFixed(2)) : null,
+    }))
+    .sort((a, b) => b.running - a.running || b.count - a.count || b.totalDurationSec - a.totalDurationSec);
+
+  return {
+    totalCalls,
+    errorCalls,
+    uniqueTools: byName.size,
+    totalDurationSec: Number(totalDurationSec.toFixed(1)),
+    activeTools,
+    hotspots,
+  };
+}
+
+/**
+ * Enrich an in-progress planner turn (`waiting_ttft` or `streaming`) with live
+ * elapsed timers and estimated streaming tokens/TPS.
+ */
+function buildLiveTurn(rawLive, nowMs = Date.now()) {
+  if (!rawLive) return null;
+  const startedAtMs = rawLive.startedAtMs ?? nowMs;
+  const streamingStartedAtMs = rawLive.streamingStartedAtMs ?? null;
+
+  let elapsedTtftSec = null;
+  let elapsedDecodeSec = null;
+
+  if (rawLive.phase === 'streaming' && streamingStartedAtMs != null) {
+    elapsedTtftSec = Math.max(0, (streamingStartedAtMs - startedAtMs) / 1000);
+    elapsedDecodeSec = Math.max(0, (nowMs - streamingStartedAtMs) / 1000);
+  } else {
+    elapsedTtftSec = Math.max(0, (nowMs - startedAtMs) / 1000);
+  }
+
+  const estThinkingTokens = Math.round((rawLive.thinkingBytes || 0) / BYTES_PER_TOKEN_EST);
+  const estResponseTokens = Math.round((rawLive.responseBytes || 0) / BYTES_PER_TOKEN_EST);
+  const estOutputTokens = estThinkingTokens + estResponseTokens;
+
+  let estLiveTps = null;
+  if (
+    rawLive.phase === 'streaming' &&
+    elapsedDecodeSec != null &&
+    elapsedDecodeSec >= 0.4 &&
+    estOutputTokens >= 15
+  ) {
+    estLiveTps = Number((estOutputTokens / elapsedDecodeSec).toFixed(1));
+  }
+
+  return {
+    stepIndex: rawLive.stepIndex ?? null,
+    phase: rawLive.phase,
+    startedAtMs,
+    streamingStartedAtMs,
+    elapsedTtftSec: Number(elapsedTtftSec.toFixed(2)),
+    elapsedDecodeSec: elapsedDecodeSec != null ? Number(elapsedDecodeSec.toFixed(2)) : null,
+    estThinkingTokens,
+    estResponseTokens,
+    estOutputTokens,
+    estLiveTps,
+  };
+}
+
+/**
+ * Build real context breakdown from SQLite `promptSnapshot`, or an honest
  * prompt/output breakdown when running in JSONL fallback mode.
  */
 function buildBreakdown(latestTurn, promptSnapshot, contextLimit) {
@@ -58,7 +185,6 @@ function buildBreakdown(latestTurn, promptSnapshot, contextLimit) {
       byRole.user.tokens + byRole.assistant.tokens + byRole.system.tokens + byRole.tool.tokens;
 
     const promptTotal = latestTurn.totalPrompt;
-    // Overhead = System Prompt + Tool/MCP Schemas (everything in prompt outside chat messages).
     const rawOverhead = Math.max(0, promptTotal - msgTokenSum);
     const totalOverheadBytes = systemPromptBytes + toolDefsBytes;
 
@@ -68,7 +194,6 @@ function buildBreakdown(latestTurn, promptSnapshot, contextLimit) {
       sysTokens = Math.round(rawOverhead * (systemPromptBytes / totalOverheadBytes));
       toolDefTokens = rawOverhead - sysTokens;
     } else if (totalOverheadBytes > 0) {
-      // Fallback byte estimate (~3.6 bytes/token) when msg estimates exceed promptTotal.
       sysTokens = Math.round(systemPromptBytes / 3.6);
       toolDefTokens = Math.round(toolDefsBytes / 3.6);
     }
@@ -138,7 +263,6 @@ function buildBreakdown(latestTurn, promptSnapshot, contextLimit) {
     };
   }
 
-  // Honest fallback when only transcript.jsonl is available.
   const fallbackCats = [
     {
       key: 'cache_read',
@@ -180,19 +304,24 @@ function buildBreakdown(latestTurn, promptSnapshot, contextLimit) {
 /**
  * Compute the complete vitals snapshot sent by `/api/vitals`.
  */
-export function computeVitals(conversationId, rawData) {
+export function computeVitals(conversationId, rawData, nowMs = Date.now()) {
   const rawTurns = rawData?.turns || [];
   const source = rawData?.source || 'none';
   const tpsPrecision = rawData?.tpsPrecision || 'none';
   const activity = rawData?.activity || 'idle';
+  const liveTurn = buildLiveTurn(rawData?.liveTurn || null, nowMs);
+  const toolStats = buildToolStats(rawData?.toolEvents || [], nowMs);
 
   if (rawTurns.length === 0) {
     return {
       conversationId,
+      serverNowMs: nowMs,
       hasData: false,
       source,
       tpsPrecision,
       activity,
+      liveTurn,
+      toolStats,
       model: { id: '', display: '' },
       contextLimit: rawData?.detectedContextLimit || 256000,
       detectedContextLimit: rawData?.detectedContextLimit || 0,
@@ -242,17 +371,18 @@ export function computeVitals(conversationId, rawData) {
       if (ttftSec != null && decodeSec != null) e2eSec = ttftSec + decodeSec;
       else if (decodeSec != null) e2eSec = decodeSec;
     } else if (decodeSec != null) {
-      // In transcript fallback, decodeSec holds the E2E step delta.
       e2eSec = decodeSec;
     }
 
+    let rawDecodeTps = null;
     let decodeTps = null;
-    let isBufferedBurst = false;
+    let isShortSample = false;
+
     if (tpsPrecision === 'decode' && decodeSec != null && decodeSec >= MIN_VALID_SEC && totalOutput > 0) {
-      const rawSpeed = totalOutput / decodeSec;
-      isBufferedBurst = decodeSec < BURST_MAX_SEC && rawSpeed > BURST_SPEED_THRESHOLD;
-      decodeTps = Number(rawSpeed.toFixed(1));
-      if (!isBufferedBurst) {
+      rawDecodeTps = Number((totalOutput / decodeSec).toFixed(1));
+      isShortSample = decodeSec < SHORT_SAMPLE_MIN_SEC || totalOutput < SHORT_SAMPLE_MIN_OUT;
+      if (!isShortSample) {
+        decodeTps = rawDecodeTps;
         sumDecodeOut += totalOutput;
         sumDecodeSec += decodeSec;
         lastValidDecodeTps = decodeTps;
@@ -304,8 +434,10 @@ export function computeVitals(conversationId, rawData) {
       decodeSec: tpsPrecision === 'decode' && decodeSec != null ? Number(decodeSec.toFixed(3)) : null,
       e2eSec: e2eSec != null ? Number(e2eSec.toFixed(3)) : null,
       decodeTps,
+      rawDecodeTps,
       e2eTps,
-      isBufferedBurst,
+      isShortSample,
+      isBufferedBurst: isShortSample,
       isWarmCache,
       isCacheDrop,
     });
@@ -327,11 +459,8 @@ export function computeVitals(conversationId, rawData) {
   const avgDecodeTps = sumDecodeSec > 0 ? Number((sumDecodeOut / sumDecodeSec).toFixed(1)) : null;
   const avgE2eTps = sumE2eSec > 0 ? Number((sumE2eOut / sumE2eSec).toFixed(1)) : null;
 
-  // Headline decode TPS: avoid showing a 1,400+ tok/s artifact on a 0.19s single-chunk tool flush.
   const headlineDecodeTps =
-    latest.decodeTps != null && !latest.isBufferedBurst
-      ? latest.decodeTps
-      : lastValidDecodeTps ?? avgDecodeTps ?? latest.decodeTps;
+    latest.decodeTps != null ? latest.decodeTps : lastValidDecodeTps ?? avgDecodeTps ?? latest.e2eTps;
 
   const avgWarmTtft =
     warmTtfts.length > 0
@@ -371,10 +500,13 @@ export function computeVitals(conversationId, rawData) {
 
   return {
     conversationId,
+    serverNowMs: nowMs,
     hasData: true,
     source,
     tpsPrecision,
     activity,
+    liveTurn,
+    toolStats,
     model: {
       id: modelId,
       display: modelDisplay,
@@ -384,7 +516,7 @@ export function computeVitals(conversationId, rawData) {
     summary: {
       turnCount: turns.length,
       headlineDecodeTps,
-      headlineDecodeIsFallback: Boolean(latest.isBufferedBurst && headlineDecodeTps !== latest.decodeTps),
+      headlineDecodeIsFallback: Boolean(latest.isShortSample && headlineDecodeTps !== latest.rawDecodeTps),
       latestDecodeTps: latest.decodeTps,
       latestE2eTps: latest.e2eTps,
       avgDecodeTps,

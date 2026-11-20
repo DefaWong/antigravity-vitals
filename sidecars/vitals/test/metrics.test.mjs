@@ -54,7 +54,7 @@ describe('computeVitals metrics engine', () => {
           ttftSec: 0.5,
           decodeSec: 20.0,
         },
-        // Turn 3: Buffered single-chunk tool JSON flush (0.19s for 271 tokens = 1426 tok/s)
+        // Turn 3: Short sample (1.0s, 253 tokens) — first-chunk buffering inflates rawDecodeTps to 253 t/s
         {
           id: 3,
           kind: 'tool',
@@ -64,13 +64,27 @@ describe('computeVitals metrics engine', () => {
           inputTokens: 1500,
           cacheReadTokens: 18500,
           cacheCreationTokens: 0,
-          outputTokens: 271,
-          thinkingTokens: 21,
-          responseTokens: 250,
-          ttftSec: 0.6,
-          decodeSec: 0.19,
+          outputTokens: 253,
+          thinkingTokens: 185,
+          responseTokens: 68,
+          ttftSec: 5.55,
+          decodeSec: 1.0,
         },
       ],
+      toolEvents: [
+        { stepIndex: 2, name: 'run_command', isRunning: false, isError: false, durationSec: 2.4 },
+        { stepIndex: 3, name: 'run_command', isRunning: true, isError: false, startedAtMs: 1_700_000_000_000 },
+        { stepIndex: 4, name: 'read_file', isRunning: false, isError: true, durationSec: 0.2 },
+      ],
+      liveTurn: {
+        stepIndex: 5,
+        phase: 'streaming',
+        startedAtMs: 1_700_000_000_000,
+        streamingStartedAtMs: 1_700_000_002_000,
+        thinkingBytes: 760,
+        responseBytes: 1140,
+        totalBytes: 1900,
+      },
       promptSnapshot: {
         byRole: {
           user: { tokens: 400, count: 2, bytes: 1600 },
@@ -88,23 +102,41 @@ describe('computeVitals metrics engine', () => {
       },
     };
 
-    const res = computeVitals('0c0859ce-44cc-467d-9cd3-3085a8ca855d', raw);
+    const nowMs = 1_700_000_006_000;
+    const res = computeVitals('0c0859ce-44cc-467d-9cd3-3085a8ca855d', raw, nowMs);
     assert.equal(res.hasData, true);
     assert.equal(res.contextLimit, 512000);
-    assert.equal(res.turns[2].isBufferedBurst, true);
+    assert.equal(res.turns[2].isShortSample, true);
+    assert.equal(res.turns[2].decodeTps, null);
+    assert.equal(res.turns[2].rawDecodeTps, 253.0);
 
-    // Ratio-of-sums avgDecodeTps excludes Turn 3's buffered burst: (1000 + 3000) / (10 + 20) = 133.3
+    // Ratio-of-sums avgDecodeTps excludes Turn 3's short sample: (1000 + 3000) / (10 + 20) = 133.3
     assert.equal(res.summary.avgDecodeTps, 133.3);
-    // Headline Decode TPS falls back to last unbuffered turn (Turn 2: 3000 / 20 = 150.0)
+    // Headline Decode TPS falls back to last steady-state turn (Turn 2: 3000 / 20 = 150.0)
     assert.equal(res.summary.headlineDecodeTps, 150.0);
     assert.equal(res.summary.headlineDecodeIsFallback, true);
 
-    // Warm vs cold TTFT: cold = 4.0, warm = (0.5 + 0.6) / 2 = 0.55 -> speedup = 7.27x
+    // Warm vs cold TTFT: cold = 4.0, warm = (0.5 + 5.55) / 2 = 3.025
     assert.equal(res.summary.avgColdTtft, 4.0);
-    assert.equal(res.summary.avgWarmTtft, 0.55);
-    assert.equal(res.summary.ttftSpeedup, 7.27);
+    assert.equal(res.summary.avgWarmTtft, 3.025);
     assert.equal(res.summary.warmCount, 2);
     assert.equal(res.summary.coldCount, 1);
+
+    // Tool hotspots & active tools
+    assert.equal(res.toolStats.totalCalls, 3);
+    assert.equal(res.toolStats.errorCalls, 1);
+    assert.equal(res.toolStats.activeTools.length, 1);
+    assert.equal(res.toolStats.activeTools[0].name, 'run_command');
+    assert.equal(res.toolStats.activeTools[0].elapsedSec, 6.0);
+    assert.equal(res.toolStats.hotspots[0].name, 'run_command');
+    assert.equal(res.toolStats.hotspots[0].count, 2);
+
+    // Live streaming turn estimation (1900 / 3.8 = 500 tok over 4.0s = 125.0 tok/s)
+    assert.equal(res.liveTurn.phase, 'streaming');
+    assert.equal(res.liveTurn.elapsedTtftSec, 2.0);
+    assert.equal(res.liveTurn.elapsedDecodeSec, 4.0);
+    assert.equal(res.liveTurn.estOutputTokens, 500);
+    assert.equal(res.liveTurn.estLiveTps, 125.0);
 
     // Window bar segments must sum identically to latestContextUsed (no double-counting prior turns)
     const segs = res.summary.latestWindowSegments;
