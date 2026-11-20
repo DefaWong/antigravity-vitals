@@ -1,10 +1,13 @@
 /*
  * Antigravity Vitals — Auxiliary Pane Frontend.
  *
- * Follows the active conversation via `window.sidecar.conversationId` (or
- * `?conversationId=` in standalone preview), polls `/api/vitals` with
- * sub-second cadence while active + ETag short-circuiting while idle, and
- * ticks live TTFT/streaming/tool timers smoothly at 100ms in the browser.
+ * Performance & Lifecycle:
+ * - Zero background work when hidden/collapsed: pauses both polling and live
+ *   timers via `visibilityState` + `ResizeObserver` (`clientWidth/Height > 0`).
+ * - Incremental DOM patching during streaming: avoids redrawing SVG charts,
+ *   turns ledger, and 100-cell matrix when `historyRev` is unchanged.
+ * - On-demand 100ms clock ticker: only active while pane is visible & model
+ *   or tools are actively running.
  */
 (() => {
   const ACTIVE_POLL_MS = 350;
@@ -20,9 +23,15 @@
     conv: null,
     etag: '',
     data: null,
+    renderedHistoryRev: '',
+    renderedToolsRev: '',
     lastOk: 0,
     clockOffsetMs: 0,
     stale: false,
+    visible: true,
+    pollTimer: null,
+    pollInFlight: false,
+    clockTimer: null,
     activeTab: 'overview',
     chartMode: 'tps', // 'tps' | 'cache'
     tpsMode: 'decode', // 'decode' | 'e2e'
@@ -30,6 +39,8 @@
     limitPresetIdx: 0, // 0 => auto detected
     turnFilter: 'all',
     expandedTurnId: null,
+    dismissedAlerts: new Set(),
+    currentAlertKey: '',
   };
 
   // ---------- Host Bridge & Theme ----------
@@ -63,6 +74,70 @@
     attributes: true,
     attributeFilter: ['style'],
   });
+
+  // ---------- Visibility & On-Demand Timers ----------
+  function isPaneVisible() {
+    if (document.visibilityState !== 'visible') return false;
+    const el = document.documentElement;
+    return el.clientWidth > 0 && el.clientHeight > 0;
+  }
+
+  function isActiveState(activity) {
+    return activity === 'waiting_ttft' || activity === 'streaming' || activity === 'tool_running';
+  }
+
+  function stopLiveClock() {
+    if (state.clockTimer != null) {
+      clearInterval(state.clockTimer);
+      state.clockTimer = null;
+    }
+  }
+
+  function syncLiveClock() {
+    const needClock = state.visible && isActiveState(state.data?.activity);
+    if (needClock && state.clockTimer == null) {
+      state.clockTimer = setInterval(updateLiveClocks, LIVE_TICK_MS);
+    } else if (!needClock && state.clockTimer != null) {
+      stopLiveClock();
+    }
+  }
+
+  function schedulePoll(delayMs) {
+    if (state.pollTimer != null) {
+      clearTimeout(state.pollTimer);
+      state.pollTimer = null;
+    }
+    if (!state.visible) return;
+    state.pollTimer = setTimeout(() => {
+      state.pollTimer = null;
+      poll();
+    }, delayMs);
+  }
+
+  function syncVisibility() {
+    const nowVisible = isPaneVisible();
+    if (nowVisible === state.visible) return;
+    state.visible = nowVisible;
+
+    if (!nowVisible) {
+      if (state.pollTimer != null) {
+        clearTimeout(state.pollTimer);
+        state.pollTimer = null;
+      }
+      stopLiveClock();
+    } else {
+      syncLiveClock();
+      if (!state.pollInFlight) {
+        schedulePoll(0);
+      }
+    }
+  }
+
+  document.addEventListener('visibilitychange', syncVisibility);
+  window.addEventListener('focus', syncVisibility);
+  if (typeof ResizeObserver !== 'undefined') {
+    new ResizeObserver(syncVisibility).observe(document.documentElement);
+  }
 
   // ---------- Formatting Helpers ----------
   const esc = (s) =>
@@ -128,17 +203,12 @@
     return 'var(--v-error)';
   }
 
-  function isActiveState(activity) {
-    return activity === 'waiting_ttft' || activity === 'streaming' || activity === 'tool_running';
-  }
-
   // ---------- Smooth 100ms Live Clocks ----------
   function updateLiveClocks() {
     const data = state.data;
-    if (!data || !isActiveState(data.activity)) return;
+    if (!state.visible || !data || !isActiveState(data.activity)) return;
     const now = nowSyncedMs();
 
-    // Update live waiting/streaming KPI and strip timers smoothly
     if (data.liveTurn && data.hasData && data.summary) {
       const lt = data.liveTurn;
       if (lt.phase === 'waiting_ttft' && lt.startedAtMs) {
@@ -159,7 +229,6 @@
       }
     }
 
-    // Update active running tool timers smoothly
     const activeTools = data.toolStats?.activeTools || [];
     if (activeTools.length > 0) {
       activeTools.forEach((tool, idx) => {
@@ -172,59 +241,12 @@
     }
   }
 
-  // ---------- Rendering ----------
-  function render() {
-    const data = state.data;
-    const conv = state.conv || data?.conversationId || '';
-    $('footerConv').textContent = conv ? `conv: ${conv.slice(0, 8)}…` : 'conv: --';
-
-    if (!data || !data.hasData || !data.summary) {
-      $('emptyState').classList.remove('hidden');
-      $('content').classList.add('hidden');
-      $('modelLabel').textContent = 'Vitals · 等待会话';
-      $('turnsCountBadge').textContent = '0';
-      $('sourceBadge').textContent = data?.source === 'transcript' ? 'JSONL' : 'SQLite';
-      $('liveDot').className = `live-dot ${state.stale ? 'dot-warn' : 'dot-live'}`;
-      $('emptyTitle').textContent =
-        data?.activity === 'waiting_ttft' || data?.activity === 'streaming'
-          ? '首轮模型正在生成中…'
-          : conv
-            ? '等待本会话首次模型调用'
-            : '未检测到活跃会话';
-      $('emptyHintText').textContent = conv ? `监听中 (${conv.slice(0, 8)}…)` : '在左侧选择任意会话即可实时监测';
-      $('footerSync').textContent = state.stale ? '重连中…' : '等待数据 · 1.5s';
-      return;
-    }
-
-    $('emptyState').classList.add('hidden');
-    $('content').classList.remove('hidden');
-
+  // ---------- Shared Status / Live Section Renderer (used by both full & surgical updates) ----------
+  function renderStatusAndLive(data) {
     const s = data.summary;
     const turns = data.turns || [];
     const last = turns[turns.length - 1];
-    const limit = activeContextLimit(data);
     const mode = effectiveTpsMode(data);
-    const active = isActiveState(data.activity);
-
-    // Header
-    $('modelLabel').textContent = data.model?.display || data.model?.id || 'Unknown Model';
-    $('modelLabel').title = `${data.model?.display || ''} (${data.model?.id || ''})`;
-    $('turnsCountBadge').textContent = String(turns.length);
-
-    const srcBadge = $('sourceBadge');
-    srcBadge.textContent = data.source === 'sqlite' ? 'SQLite' : 'JSONL';
-    srcBadge.title =
-      data.source === 'sqlite'
-        ? '方案 A：只读解析 conversations/<id>.db 的 gen_metadata 精确毫秒遥测'
-        : '降级模式：读取 transcript.jsonl（Token 与缓存精确，TPS 为端到端估算）';
-
-    const tpsBtn = $('tpsModeBtn');
-    tpsBtn.textContent = mode === 'decode' ? 'Decode' : 'E2E';
-    tpsBtn.disabled = data.tpsPrecision !== 'decode';
-    tpsBtn.title =
-      data.tpsPrecision === 'decode'
-        ? '点击切换纯解码 TPS (Decode) 与端到端 TPS (E2E)'
-        : '当前处于 JSONL 降级模式，仅提供端到端 (E2E) 口径';
 
     // Live dot + footer sync
     const liveDot = $('liveDot');
@@ -249,26 +271,6 @@
     } else {
       liveDot.className = 'live-dot dot-ok';
       $('footerSync').textContent = '实时监测 · 0.9s';
-    }
-
-    // Re-evaluate context alert if user overrode limit manually
-    const ctxPct = limit > 0 ? (s.latestContextUsed / limit) * 100 : 0;
-    let alertObj = data.alert;
-    if (!alertObj && ctxPct >= 80) {
-      alertObj = {
-        level: ctxPct >= 92 ? 'error' : 'warning',
-        title: `上下文窗口接近上限（${ctxPct.toFixed(1)}%）`,
-        desc: `当前占用 ${s.latestContextUsed.toLocaleString()} / ${limit.toLocaleString()} tokens。建议使用 /compact 压缩历史上下文。`,
-      };
-    }
-
-    const alertEl = $('alertBanner');
-    if (alertObj) {
-      alertEl.className = `alert-banner level-${alertObj.level === 'error' ? 'error' : 'warning'}`;
-      $('alertTitle').textContent = alertObj.title;
-      $('alertDesc').textContent = alertObj.desc;
-    } else {
-      alertEl.className = 'alert-banner hidden';
     }
 
     // KPI 1: TPS & TTFT
@@ -306,6 +308,126 @@
       tpsTag.className = 'mono tag-ok';
     }
 
+    // Latest Turn Strip
+    const stripCard = $('lastTurnCard');
+    stripCard.classList.toggle('is-live', data.activity === 'streaming' || data.activity === 'waiting_ttft');
+    if (data.activity === 'waiting_ttft' && data.liveTurn) {
+      $('lastTurnLabel').textContent = '请求中';
+      $('lastTurnMeta').textContent = `等待首字 · 已耗时 ${data.liveTurn.elapsedTtftSec.toFixed(1)}s`;
+    } else if (data.activity === 'streaming' && data.liveTurn) {
+      $('lastTurnLabel').textContent = '生成中';
+      $('lastTurnMeta').textContent = `~${fmtNum(data.liveTurn.estOutputTokens)} tok · 解码 ${(data.liveTurn.elapsedDecodeSec || 0).toFixed(1)}s`;
+    } else {
+      $('lastTurnLabel').textContent = '最近调用';
+      const durStr = last.e2eSec != null ? `耗时 ${last.e2eSec.toFixed(1)}s` : '无耗时';
+      $('lastTurnMeta').textContent = `#${last.id} · 输出 ${fmtNum(last.totalOutput)} tok · ${durStr}`;
+    }
+  }
+
+  /**
+   * Surgical live update when `historyRev` is unchanged during streaming:
+   * updates only live KPI/status/strip (and tools card if `toolsRev` changed),
+   * completely skipping SVG chart, turns ledger, and 100-cell grid rebuilds.
+   */
+  function renderLivePatch(data) {
+    renderStatusAndLive(data);
+    if (data.toolsRev !== state.renderedToolsRev) {
+      renderToolsCard(data.toolStats);
+      state.renderedToolsRev = data.toolsRev || '';
+    }
+    syncLiveClock();
+    if (isActiveState(data.activity)) updateLiveClocks();
+  }
+
+  // ---------- Full Rendering ----------
+  function render() {
+    const data = state.data;
+    const conv = state.conv || data?.conversationId || '';
+    $('footerConv').textContent = conv ? `conv: ${conv.slice(0, 8)}…` : 'conv: --';
+
+    if (!data || !data.hasData || !data.summary) {
+      state.renderedHistoryRev = '';
+      state.renderedToolsRev = '';
+      $('emptyState').classList.remove('hidden');
+      $('content').classList.add('hidden');
+      $('modelLabel').textContent = 'Vitals · 等待会话';
+      $('turnsCountBadge').textContent = '0';
+      $('sourceBadge').textContent = data?.source === 'transcript' ? 'JSONL' : 'SQLite';
+      $('liveDot').className = `live-dot ${state.stale ? 'dot-warn' : 'dot-live'}`;
+      $('emptyTitle').textContent =
+        data?.activity === 'waiting_ttft' || data?.activity === 'streaming'
+          ? '首轮模型正在生成中…'
+          : conv
+            ? '等待本会话首次模型调用'
+            : '未检测到活跃会话';
+      $('emptyHintText').textContent = conv ? `监听中 (${conv.slice(0, 8)}…)` : '在左侧选择任意会话即可实时监测';
+      $('footerSync').textContent = state.stale ? '重连中…' : '等待数据 · 1.5s';
+      syncLiveClock();
+      return;
+    }
+
+    $('emptyState').classList.add('hidden');
+    $('content').classList.remove('hidden');
+
+    const s = data.summary;
+    const turns = data.turns || [];
+    const last = turns[turns.length - 1];
+    const limit = activeContextLimit(data);
+    const mode = effectiveTpsMode(data);
+
+    // Header
+    $('modelLabel').textContent = data.model?.display || data.model?.id || 'Unknown Model';
+    $('modelLabel').title = `${data.model?.display || ''} (${data.model?.id || ''})`;
+    $('turnsCountBadge').textContent = String(turns.length);
+
+    const srcBadge = $('sourceBadge');
+    srcBadge.textContent = data.source === 'sqlite' ? 'SQLite' : 'JSONL';
+    srcBadge.title =
+      data.source === 'sqlite'
+        ? '方案 A：只读解析 conversations/<id>.db 的 gen_metadata 精确毫秒遥测'
+        : '降级模式：读取 transcript.jsonl（Token 与缓存精确，TPS 为端到端估算）';
+
+    const tpsBtn = $('tpsModeBtn');
+    tpsBtn.textContent = mode === 'decode' ? 'Decode' : 'E2E';
+    tpsBtn.disabled = data.tpsPrecision !== 'decode';
+    tpsBtn.title =
+      data.tpsPrecision === 'decode'
+        ? '点击切换纯解码 TPS (Decode) 与端到端 TPS (E2E)'
+        : '当前处于 JSONL 降级模式，仅提供端到端 (E2E) 口径';
+
+    // Dismissible Alert Banner
+    const ctxPct = limit > 0 ? (s.latestContextUsed / limit) * 100 : 0;
+    let alertObj = data.alert;
+    if (!alertObj && ctxPct >= 80) {
+      alertObj = {
+        code: 'context_high',
+        level: ctxPct >= 92 ? 'error' : 'warning',
+        title: `上下文窗口接近上限（${ctxPct.toFixed(1)}%）`,
+        desc: `当前占用 ${s.latestContextUsed.toLocaleString()} / ${limit.toLocaleString()} tokens。建议使用 /compact 压缩历史上下文。`,
+      };
+    }
+
+    let alertKey = '';
+    if (alertObj) {
+      alertKey =
+        alertObj.code === 'context_high'
+          ? `${conv}:context_high:${alertObj.level}:${Math.floor(ctxPct / 5) * 5}`
+          : `${conv}:${alertObj.code || 'alert'}:${last.id}`;
+    }
+    state.currentAlertKey = alertKey;
+
+    const alertEl = $('alertBanner');
+    if (alertObj && !state.dismissedAlerts.has(alertKey)) {
+      alertEl.className = `alert-banner level-${alertObj.level === 'error' ? 'error' : 'warning'}`;
+      $('alertTitle').textContent = alertObj.title;
+      $('alertDesc').textContent = alertObj.desc;
+    } else {
+      alertEl.className = 'alert-banner hidden';
+    }
+
+    // Status, KPI 1 & Latest Strip
+    renderStatusAndLive(data);
+
     // KPI 2: Cache Hit Rate
     const kpiCache = $('kpiCache');
     kpiCache.textContent = `${s.overallCacheRate.toFixed(1)}%`;
@@ -342,7 +464,7 @@
     $('kpiInTok').textContent = fmtNum(s.totalPromptAll);
     $('kpiOutTok').textContent = fmtNum(s.totalOutputAll);
 
-    // Context Window Segmented Bar (exact current turn components)
+    // Context Window Segmented Bar
     const segs = s.latestWindowSegments;
     $('ctxBarSummary').textContent = `${s.latestContextUsed.toLocaleString()} / ${limit.toLocaleString()}`;
     const pctW = (val) => `${Math.min(100, Math.max(0, limit > 0 ? (val / limit) * 100 : 0)).toFixed(2)}%`;
@@ -356,27 +478,16 @@
     $('legThinking').textContent = fmtNum(segs.thinking);
     $('legReply').textContent = fmtNum(segs.response);
 
-    // Latest Turn Strip (morphs into live indicator during generation)
-    const stripCard = $('lastTurnCard');
-    stripCard.classList.toggle('is-live', data.activity === 'streaming' || data.activity === 'waiting_ttft');
-    if (data.activity === 'waiting_ttft' && data.liveTurn) {
-      $('lastTurnLabel').textContent = '请求中';
-      $('lastTurnMeta').textContent = `等待首字 · 已耗时 ${data.liveTurn.elapsedTtftSec.toFixed(1)}s`;
-    } else if (data.activity === 'streaming' && data.liveTurn) {
-      $('lastTurnLabel').textContent = '生成中';
-      $('lastTurnMeta').textContent = `~${fmtNum(data.liveTurn.estOutputTokens)} tok · 解码 ${(data.liveTurn.elapsedDecodeSec || 0).toFixed(1)}s`;
-    } else {
-      $('lastTurnLabel').textContent = '最近调用';
-      const durStr = last.e2eSec != null ? `耗时 ${last.e2eSec.toFixed(1)}s` : '无耗时';
-      $('lastTurnMeta').textContent = `#${last.id} · 输出 ${fmtNum(last.totalOutput)} tok · ${durStr}`;
-    }
-
     renderTrendChart(turns, mode);
     renderToolsCard(data.toolStats);
     renderTurnsList(turns, mode);
     renderBreakdown(data, limit);
 
-    if (active) updateLiveClocks();
+    state.renderedHistoryRev = data.historyRev || '';
+    state.renderedToolsRev = data.toolsRev || '';
+
+    syncLiveClock();
+    if (isActiveState(data.activity)) updateLiveClocks();
   }
 
   function renderToolsCard(toolStats) {
@@ -482,7 +593,7 @@
       const formatInsp = (t) => {
         const v = getVal(t);
         if (mode === 'decode' && t.isShortSample) {
-          return `#${t.id} · 短采样 (${fmtSec(t.decodeSec)} / ${t.totalOutput} tok) · TTFT ${fmtSec(t.ttftSec)}`;
+          return `#${t.id} · 短采样 ${fmtSec(t.decodeSec, 1)}/${t.totalOutput}t · TTFT ${fmtSec(t.ttftSec)}`;
         }
         return `#${t.id} · ${v != null ? v.toFixed(1) : '--'} t/s · TTFT ${fmtSec(t.ttftSec)}`;
       };
@@ -810,6 +921,13 @@
     }
   });
 
+  $('alertCloseBtn').addEventListener('click', () => {
+    if (state.currentAlertKey) {
+      state.dismissedAlerts.add(state.currentAlertKey);
+    }
+    $('alertBanner').className = 'alert-banner hidden';
+  });
+
   $('tpsModeBtn').addEventListener('click', () => {
     if (state.data?.tpsPrecision !== 'decode') return;
     state.tpsMode = state.tpsMode === 'decode' ? 'e2e' : 'decode';
@@ -849,8 +967,10 @@
     render();
   });
 
-  // ---------- Polling Loop + 100ms Live Ticker ----------
+  // ---------- Polling Loop (auto-pauses when hidden) ----------
   async function poll() {
+    if (!state.visible || state.pollInFlight) return;
+    state.pollInFlight = true;
     let delay = IDLE_POLL_MS;
     try {
       const conv = currentConv();
@@ -858,6 +978,8 @@
         state.conv = conv;
         state.etag = '';
         state.data = null;
+        state.renderedHistoryRev = '';
+        state.renderedToolsRev = '';
         state.expandedTurnId = null;
         state.limitPresetIdx = 0;
       }
@@ -877,11 +999,23 @@
 
       if (!res.unchanged) {
         state.etag = res.etag || '';
+        const canPatchLive =
+          Boolean(res.hasData) &&
+          Boolean(state.data?.hasData) &&
+          Boolean(res.historyRev) &&
+          res.historyRev === state.renderedHistoryRev &&
+          !wasStale;
+
         state.data = res;
         if (!state.tpsModeUserPinned && res.tpsPrecision === 'decode') {
           state.tpsMode = 'decode';
         }
-        render();
+
+        if (canPatchLive) {
+          renderLivePatch(res);
+        } else {
+          render();
+        }
       } else if (wasStale) {
         render();
       }
@@ -896,11 +1030,15 @@
       render();
       delay = EMPTY_POLL_MS;
     } finally {
-      setTimeout(poll, delay);
+      state.pollInFlight = false;
+      syncLiveClock();
+      schedulePoll(delay);
     }
   }
 
-  setInterval(updateLiveClocks, LIVE_TICK_MS);
+  state.visible = isPaneVisible();
   render();
-  poll();
+  if (state.visible) {
+    poll();
+  }
 })();
