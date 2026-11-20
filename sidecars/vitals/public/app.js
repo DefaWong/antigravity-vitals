@@ -2,14 +2,15 @@
  * Antigravity Vitals — Auxiliary Pane Frontend.
  *
  * Follows the active conversation via `window.sidecar.conversationId` (or
- * `?conversationId=` in standalone preview), polls `/api/vitals` with ETag
- * short-circuiting, and mirrors host light/dark theme tokens injected by
- * `/preload.js`.
+ * `?conversationId=` in standalone preview), polls `/api/vitals` with
+ * sub-second cadence while active + ETag short-circuiting while idle, and
+ * ticks live TTFT/streaming/tool timers smoothly at 100ms in the browser.
  */
 (() => {
-  const ACTIVE_POLL_MS = 1200;
-  const IDLE_POLL_MS = 2000;
-  const EMPTY_POLL_MS = 2500;
+  const ACTIVE_POLL_MS = 350;
+  const IDLE_POLL_MS = 900;
+  const EMPTY_POLL_MS = 1500;
+  const LIVE_TICK_MS = 100;
   const LIMIT_PRESETS = [0, 200000, 256000, 512000, 1000000]; // 0 = auto-detected
 
   const $ = (id) => document.getElementById(id);
@@ -20,6 +21,7 @@
     etag: '',
     data: null,
     lastOk: 0,
+    clockOffsetMs: 0,
     stale: false,
     activeTab: 'overview',
     chartMode: 'tps', // 'tps' | 'cache'
@@ -66,6 +68,10 @@
   const esc = (s) =>
     String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
+  function nowSyncedMs() {
+    return Date.now() + state.clockOffsetMs;
+  }
+
   function fmtNum(n) {
     if (n == null || !Number.isFinite(n)) return '--';
     if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
@@ -83,6 +89,16 @@
   function fmtSec(sec, digits = 2) {
     if (sec == null || !Number.isFinite(sec)) return '--';
     return `${sec.toFixed(digits)}s`;
+  }
+
+  function fmtDurShort(sec) {
+    if (sec == null || !Number.isFinite(sec)) return '--';
+    if (sec >= 60) {
+      const m = Math.floor(sec / 60);
+      const s = Math.round(sec % 60);
+      return `${m}m${String(s).padStart(2, '0')}s`;
+    }
+    return `${sec.toFixed(1)}s`;
   }
 
   function fmtTps(tps) {
@@ -112,6 +128,50 @@
     return 'var(--v-error)';
   }
 
+  function isActiveState(activity) {
+    return activity === 'waiting_ttft' || activity === 'streaming' || activity === 'tool_running';
+  }
+
+  // ---------- Smooth 100ms Live Clocks ----------
+  function updateLiveClocks() {
+    const data = state.data;
+    if (!data || !isActiveState(data.activity)) return;
+    const now = nowSyncedMs();
+
+    // Update live waiting/streaming KPI and strip timers smoothly
+    if (data.liveTurn && data.hasData && data.summary) {
+      const lt = data.liveTurn;
+      if (lt.phase === 'waiting_ttft' && lt.startedAtMs) {
+        const waitSec = Math.max(0, (now - lt.startedAtMs) / 1000);
+        $('kpiTtft').textContent = `${waitSec.toFixed(1)}s…`;
+        $('lastTurnLabel').textContent = '请求中';
+        $('lastTurnMeta').textContent = `等待首字 · 已耗时 ${waitSec.toFixed(1)}s`;
+      } else if (lt.phase === 'streaming' && lt.streamingStartedAtMs) {
+        const decSec = Math.max(0.1, (now - lt.streamingStartedAtMs) / 1000);
+        const estTok = lt.estOutputTokens || 0;
+        const liveTps = decSec >= 0.4 && estTok >= 15 ? estTok / decSec : null;
+        if (liveTps != null) {
+          $('kpiTps').textContent = liveTps.toFixed(1);
+        }
+        $('kpiTtft').textContent = fmtSec(lt.elapsedTtftSec);
+        $('lastTurnLabel').textContent = '生成中';
+        $('lastTurnMeta').textContent = `~${fmtNum(estTok)} tok · 解码 ${decSec.toFixed(1)}s`;
+      }
+    }
+
+    // Update active running tool timers smoothly
+    const activeTools = data.toolStats?.activeTools || [];
+    if (activeTools.length > 0) {
+      activeTools.forEach((tool, idx) => {
+        const el = $(`active-tool-timer-${idx}`);
+        if (el && tool.startedAtMs) {
+          const sec = Math.max(0, (now - tool.startedAtMs) / 1000);
+          el.textContent = `${sec.toFixed(1)}s`;
+        }
+      });
+    }
+  }
+
   // ---------- Rendering ----------
   function render() {
     const data = state.data;
@@ -125,9 +185,14 @@
       $('turnsCountBadge').textContent = '0';
       $('sourceBadge').textContent = data?.source === 'transcript' ? 'JSONL' : 'SQLite';
       $('liveDot').className = `live-dot ${state.stale ? 'dot-warn' : 'dot-live'}`;
-      $('emptyTitle').textContent = conv ? '等待本会话首次模型调用' : '未检测到活跃会话';
+      $('emptyTitle').textContent =
+        data?.activity === 'waiting_ttft' || data?.activity === 'streaming'
+          ? '首轮模型正在生成中…'
+          : conv
+            ? '等待本会话首次模型调用'
+            : '未检测到活跃会话';
       $('emptyHintText').textContent = conv ? `监听中 (${conv.slice(0, 8)}…)` : '在左侧选择任意会话即可实时监测';
-      $('footerSync').textContent = state.stale ? '重连中…' : '等待数据 · 2.5s';
+      $('footerSync').textContent = state.stale ? '重连中…' : '等待数据 · 1.5s';
       return;
     }
 
@@ -139,7 +204,7 @@
     const last = turns[turns.length - 1];
     const limit = activeContextLimit(data);
     const mode = effectiveTpsMode(data);
-    const isActive = data.activity === 'streaming' || data.activity === 'tool_running';
+    const active = isActiveState(data.activity);
 
     // Header
     $('modelLabel').textContent = data.model?.display || data.model?.id || 'Unknown Model';
@@ -166,21 +231,24 @@
     if (state.stale) {
       liveDot.className = 'live-dot dot-warn';
       $('footerSync').textContent = '连接中断 · 重试中…';
+    } else if (data.activity === 'waiting_ttft') {
+      liveDot.className = 'live-dot dot-live';
+      $('footerSync').textContent = '等待首字 · 0.35s';
     } else if (data.activity === 'streaming') {
       liveDot.className = 'live-dot dot-live';
-      $('footerSync').textContent = '模型生成中 · 1.2s';
+      $('footerSync').textContent = '流式采样 · 0.35s';
     } else if (data.activity === 'tool_running') {
       liveDot.className = 'live-dot dot-live';
-      $('footerSync').textContent = '工具执行中 · 1.2s';
+      $('footerSync').textContent = '工具运行 · 0.35s';
     } else if (data.alert?.level === 'error') {
       liveDot.className = 'live-dot dot-err';
-      $('footerSync').textContent = '同步正常 · 2.0s';
+      $('footerSync').textContent = '实时监测 · 0.9s';
     } else if (data.alert?.level === 'warning') {
       liveDot.className = 'live-dot dot-warn';
-      $('footerSync').textContent = '同步正常 · 2.0s';
+      $('footerSync').textContent = '实时监测 · 0.9s';
     } else {
       liveDot.className = 'live-dot dot-ok';
-      $('footerSync').textContent = '同步正常 · 2.0s';
+      $('footerSync').textContent = '实时监测 · 0.9s';
     }
 
     // Re-evaluate context alert if user overrode limit manually
@@ -205,15 +273,27 @@
 
     // KPI 1: TPS & TTFT
     $('tpsTitle').textContent = mode === 'decode' ? '纯解码 TPS' : '端到端 TPS';
-    const mainTps = mode === 'decode' ? s.headlineDecodeTps : s.latestE2eTps;
+    let mainTps = mode === 'decode' ? s.headlineDecodeTps : s.latestE2eTps;
+    if (data.activity === 'streaming' && data.liveTurn?.estLiveTps != null) {
+      mainTps = data.liveTurn.estLiveTps;
+    }
     const avgTps = mode === 'decode' ? s.avgDecodeTps : s.avgE2eTps;
     $('kpiTps').textContent = fmtTps(mainTps);
-    $('kpiTtft').textContent = fmtSec(s.latestTtftSec);
+    $('kpiTtft').textContent =
+      data.activity === 'streaming' && data.liveTurn?.elapsedTtftSec != null
+        ? fmtSec(data.liveTurn.elapsedTtftSec)
+        : fmtSec(s.latestTtftSec);
     $('kpiAvgTps').textContent = fmtTps(avgTps);
 
     const tpsTag = $('tpsStateTag');
-    if (isActive) {
-      tpsTag.textContent = data.activity === 'streaming' ? '生成中' : '工具中';
+    if (data.activity === 'waiting_ttft') {
+      tpsTag.textContent = '等待首字';
+      tpsTag.className = 'mono tag-live';
+    } else if (data.activity === 'streaming') {
+      tpsTag.textContent = data.liveTurn?.estLiveTps != null ? '流式实时' : '生成中';
+      tpsTag.className = 'mono tag-live';
+    } else if (data.activity === 'tool_running') {
+      tpsTag.textContent = '工具中';
       tpsTag.className = 'mono tag-live';
     } else if (mode === 'decode' && s.headlineDecodeIsFallback) {
       tpsTag.textContent = '上轮稳态';
@@ -262,7 +342,7 @@
     $('kpiInTok').textContent = fmtNum(s.totalPromptAll);
     $('kpiOutTok').textContent = fmtNum(s.totalOutputAll);
 
-    // Context Window Segmented Bar
+    // Context Window Segmented Bar (exact current turn components)
     const segs = s.latestWindowSegments;
     $('ctxBarSummary').textContent = `${s.latestContextUsed.toLocaleString()} / ${limit.toLocaleString()}`;
     const pctW = (val) => `${Math.min(100, Math.max(0, limit > 0 ? (val / limit) * 100 : 0)).toFixed(2)}%`;
@@ -276,13 +356,97 @@
     $('legThinking').textContent = fmtNum(segs.thinking);
     $('legReply').textContent = fmtNum(segs.response);
 
-    // Latest Turn Strip
-    const durStr = last.e2eSec != null ? `耗时 ${last.e2eSec.toFixed(1)}s` : '无耗时';
-    $('lastTurnMeta').textContent = `#${last.id} · 输出 ${fmtNum(last.totalOutput)} tok · ${durStr}`;
+    // Latest Turn Strip (morphs into live indicator during generation)
+    const stripCard = $('lastTurnCard');
+    stripCard.classList.toggle('is-live', data.activity === 'streaming' || data.activity === 'waiting_ttft');
+    if (data.activity === 'waiting_ttft' && data.liveTurn) {
+      $('lastTurnLabel').textContent = '请求中';
+      $('lastTurnMeta').textContent = `等待首字 · 已耗时 ${data.liveTurn.elapsedTtftSec.toFixed(1)}s`;
+    } else if (data.activity === 'streaming' && data.liveTurn) {
+      $('lastTurnLabel').textContent = '生成中';
+      $('lastTurnMeta').textContent = `~${fmtNum(data.liveTurn.estOutputTokens)} tok · 解码 ${(data.liveTurn.elapsedDecodeSec || 0).toFixed(1)}s`;
+    } else {
+      $('lastTurnLabel').textContent = '最近调用';
+      const durStr = last.e2eSec != null ? `耗时 ${last.e2eSec.toFixed(1)}s` : '无耗时';
+      $('lastTurnMeta').textContent = `#${last.id} · 输出 ${fmtNum(last.totalOutput)} tok · ${durStr}`;
+    }
 
     renderTrendChart(turns, mode);
+    renderToolsCard(data.toolStats);
     renderTurnsList(turns, mode);
     renderBreakdown(data, limit);
+
+    if (active) updateLiveClocks();
+  }
+
+  function renderToolsCard(toolStats) {
+    const summaryEl = $('toolsSummary');
+    const activeWrap = $('activeToolsStrip');
+    const listEl = $('toolsList');
+
+    if (!toolStats || toolStats.totalCalls === 0) {
+      summaryEl.textContent = '0 次';
+      activeWrap.classList.add('hidden');
+      activeWrap.innerHTML = '';
+      listEl.innerHTML = `<div class="tools-empty">本会话尚未调用工具</div>`;
+      return;
+    }
+
+    const errText = toolStats.errorCalls > 0 ? ` · ${toolStats.errorCalls} 错` : '';
+    const durText = toolStats.totalDurationSec > 0 ? ` · ${fmtDurShort(toolStats.totalDurationSec)}` : '';
+    summaryEl.textContent = `${toolStats.totalCalls} 次${durText}${errText}`;
+
+    const active = toolStats.activeTools || [];
+    if (active.length > 0) {
+      activeWrap.classList.remove('hidden');
+      activeWrap.innerHTML = active
+        .map(
+          (t, idx) => `
+          <div class="active-tool-pill">
+            <span class="active-tool-left">
+              <span class="live-dot dot-live" aria-hidden="true"></span>
+              <span class="mono strong truncate">${esc(t.name)}</span>
+              <span class="muted">运行中</span>
+            </span>
+            <span id="active-tool-timer-${idx}" class="mono strong">${(t.elapsedSec || 0).toFixed(1)}s</span>
+          </div>
+        `
+        )
+        .join('');
+    } else {
+      activeWrap.classList.add('hidden');
+      activeWrap.innerHTML = '';
+    }
+
+    const top = (toolStats.hotspots || []).slice(0, 5);
+    const maxCount = Math.max(1, ...top.map((t) => t.count));
+
+    listEl.innerHTML = top
+      .map((t) => {
+        const w = Math.max(6, (t.count / maxCount) * 100);
+        const dur = t.totalDurationSec > 0 ? fmtDurShort(t.totalDurationSec) : '';
+        const errPill = t.errors > 0 ? `<span class="tool-err-pill mono">${t.errors} 错</span>` : '';
+        const runDot = t.running > 0 ? `<span class="live-dot dot-live" aria-hidden="true"></span>` : '';
+        return `
+          <div class="tool-row">
+            <div class="tool-row-head">
+              <span class="tool-name-wrap">
+                ${runDot}
+                <span class="tool-name mono truncate">${esc(t.name)}</span>
+                ${errPill}
+              </span>
+              <span class="tool-metrics mono">
+                <span class="strong">×${t.count}</span>
+                ${dur ? `<span>${dur}</span>` : ''}
+              </span>
+            </div>
+            <div class="tool-bar-track">
+              <div class="tool-bar-fill${t.running > 0 ? ' is-running' : ''}" style="width: ${w.toFixed(1)}%;"></div>
+            </div>
+          </div>
+        `;
+      })
+      .join('');
   }
 
   function renderTrendChart(turns, mode) {
@@ -309,37 +473,36 @@
     const latest = recent[n - 1];
 
     if (state.chartMode === 'tps') {
-      const getVal = (t) => {
-        if (mode === 'decode') {
-          if (t.isBufferedBurst) return t.e2eTps || 0;
-          return t.decodeTps || 0;
-        }
-        return t.e2eTps || 0;
-      };
-      const vals = recent.map(getVal);
-      const maxTps = Math.max(80, ...vals) * 1.12;
+      const getVal = (t) => (mode === 'decode' ? t.decodeTps : t.e2eTps);
+      const validVals = recent.map(getVal).filter((v) => v != null && v > 0);
+      const maxTps = Math.max(80, ...(validVals.length ? validVals : [100])) * 1.12;
       const maxTtft = Math.max(4, ...recent.map((t) => t.ttftSec || 0));
       const stepX = n > 1 ? innerW / (n - 1) : 0;
 
       const formatInsp = (t) => {
         const v = getVal(t);
-        const burstNote = mode === 'decode' && t.isBufferedBurst ? ' (E2E)' : '';
-        return `#${t.id} · ${v > 0 ? v.toFixed(1) : '--'} t/s${burstNote} · TTFT ${fmtSec(t.ttftSec)}`;
+        if (mode === 'decode' && t.isShortSample) {
+          return `#${t.id} · 短采样 (${fmtSec(t.decodeSec)} / ${t.totalOutput} tok) · TTFT ${fmtSec(t.ttftSec)}`;
+        }
+        return `#${t.id} · ${v != null ? v.toFixed(1) : '--'} t/s · TTFT ${fmtSec(t.ttftSec)}`;
       };
       insp.textContent = formatInsp(latest);
 
       const points = recent.map((t, i) => {
         const cx = n > 1 ? padL + i * stepX : padL + innerW / 2;
         const v = getVal(t);
-        const cy = padT + innerH - (v / maxTps) * innerH;
+        const cy = v != null ? padT + innerH - (v / maxTps) * innerH : null;
         const barH = t.ttftSec != null ? Math.max(3, (t.ttftSec / maxTtft) * (innerH * 0.65)) : 0;
-        return { cx, cy, barH, t };
+        return { cx, cy, v, barH, t, idx: i };
       });
 
-      const pathD = points.map((p, i) => `${i === 0 ? 'M' : 'L'}${p.cx.toFixed(1)},${p.cy.toFixed(1)}`).join(' ');
+      const validPoints = points.filter((p) => p.cy != null);
+      const pathD = validPoints
+        .map((p, i) => `${i === 0 ? 'M' : 'L'}${p.cx.toFixed(1)},${p.cy.toFixed(1)}`)
+        .join(' ');
       const areaD =
-        n > 1
-          ? `${pathD} L${points[n - 1].cx.toFixed(1)},${padT + innerH} L${points[0].cx.toFixed(1)},${padT + innerH} Z`
+        validPoints.length > 1
+          ? `${pathD} L${validPoints[validPoints.length - 1].cx.toFixed(1)},${padT + innerH} L${validPoints[0].cx.toFixed(1)},${padT + innerH} Z`
           : '';
 
       wrap.innerHTML = `
@@ -359,23 +522,24 @@
             )
             .join('')}
           ${areaD ? `<path d="${areaD}" fill="var(--v-chart-1)" opacity="0.11" />` : ''}
-          ${n > 1 ? `<path d="${pathD}" fill="none" stroke="var(--v-chart-1)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />` : ''}
+          ${validPoints.length > 1 ? `<path d="${pathD}" fill="none" stroke="var(--v-chart-1)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" />` : ''}
           ${points
-            .map(
-              (p, idx) => `
-              <g class="chart-pt" data-idx="${idx}" style="cursor:pointer;">
-                <circle cx="${p.cx.toFixed(1)}" cy="${p.cy.toFixed(1)}" r="10" fill="transparent" />
-                <circle cx="${p.cx.toFixed(1)}" cy="${p.cy.toFixed(1)}" r="3.2" fill="var(--v-card)" stroke="${
-                  p.t.isBufferedBurst && mode === 'decode' ? 'var(--v-warning)' : 'var(--v-chart-1)'
-                }" stroke-width="2" />
-                ${
-                  idx === 0 || idx === n - 1 || idx % 3 === 0
-                    ? `<text x="${p.cx.toFixed(1)}" y="${H - 3}" text-anchor="middle" fill="var(--v-muted)" font-size="9" font-family="monospace">#${p.t.id}</text>`
-                    : ''
-                }
-              </g>
-            `
-            )
+            .map((p, idx) => {
+              const dotY = p.cy != null ? p.cy : padT + innerH - 2;
+              const strokeColor = p.cy != null ? 'var(--v-chart-1)' : 'var(--v-muted)';
+              const dotR = p.cy != null ? '3.2' : '2.3';
+              return `
+                <g class="chart-pt" data-idx="${idx}" style="cursor:pointer;">
+                  <rect x="${(p.cx - 9).toFixed(1)}" y="${padT}" width="18" height="${innerH}" fill="transparent" />
+                  <circle cx="${p.cx.toFixed(1)}" cy="${dotY.toFixed(1)}" r="${dotR}" fill="var(--v-card)" stroke="${strokeColor}" stroke-width="${p.cy != null ? '2' : '1.4'}" ${p.cy == null ? 'stroke-dasharray="2 1.5"' : ''} />
+                  ${
+                    idx === 0 || idx === n - 1 || idx % 3 === 0
+                      ? `<text x="${p.cx.toFixed(1)}" y="${H - 3}" text-anchor="middle" fill="var(--v-muted)" font-size="9" font-family="monospace">#${p.t.id}</text>`
+                      : ''
+                  }
+                </g>
+              `;
+            })
             .join('')}
         </svg>
       `;
@@ -446,17 +610,17 @@
     container.innerHTML = filtered
       .map((t) => {
         const isOpen = state.expandedTurnId === t.id;
-        const shownTps = mode === 'decode' ? (t.isBufferedBurst ? t.e2eTps : t.decodeTps) : t.e2eTps;
+        const isShortInDecode = mode === 'decode' && t.isShortSample;
+        const shownTps = mode === 'decode' ? t.decodeTps : t.e2eTps;
         const color = cacheToneColor(t.cacheRate);
 
         const kindBadge =
           t.kind === 'tool'
             ? `<span class="turn-badge mono">Tool×${t.tools}</span>`
             : `<span class="turn-badge reply mono">Reply</span>`;
-        const burstBadge =
-          mode === 'decode' && t.isBufferedBurst
-            ? `<span class="turn-badge burst mono" title="单包缓冲工具调用（${fmtSec(t.decodeSec)}），此处显示端到端 TPS">短包</span>`
-            : '';
+        const shortBadge = isShortInDecode
+          ? `<span class="turn-badge burst mono" title="流式解码仅 ${fmtSec(t.decodeSec)}（${t.totalOutput} tok），首包缓冲导致纯解码速率偏高，已过滤以免失真">短采样</span>`
+          : '';
 
         return `
           <div class="turn-card">
@@ -465,11 +629,13 @@
                 <div class="turn-meta">
                   <span class="turn-id mono">#${t.id}</span>
                   ${kindBadge}
-                  ${burstBadge}
+                  ${shortBadge}
                   <span class="muted mono">${esc(fmtClock(t.timestampMs))}</span>
                 </div>
                 <div class="turn-nums mono">
-                  <span class="strong">${fmtTps(shownTps)} t/s</span>
+                  <span class="${isShortInDecode ? 'muted' : 'strong'}">${
+                    isShortInDecode ? `${fmtTps(t.e2eTps)} e2e` : `${fmtTps(shownTps)} t/s`
+                  }</span>
                   <span style="color: ${color};">${t.cacheRate.toFixed(0)}%</span>
                 </div>
               </div>
@@ -481,7 +647,9 @@
               isOpen
                 ? `
                 <div class="turn-details mono">
-                  <div class="detail-kv"><span class="muted">纯解码 TPS</span><span>${t.isBufferedBurst ? `${fmtTps(t.decodeTps)} (短包)` : `${fmtTps(t.decodeTps)} t/s`}</span></div>
+                  <div class="detail-kv"><span class="muted">纯解码 TPS</span><span>${
+                    t.isShortSample ? `短采样 (${fmtTps(t.rawDecodeTps)})` : `${fmtTps(t.decodeTps)} t/s`
+                  }</span></div>
                   <div class="detail-kv"><span class="muted">端到端 TPS</span><span>${fmtTps(t.e2eTps)} t/s</span></div>
                   <div class="detail-kv"><span class="muted">首字 TTFT</span><span>${fmtSec(t.ttftSec)}</span></div>
                   <div class="detail-kv"><span class="muted">解码耗时</span><span>${fmtSec(t.decodeSec)}</span></div>
@@ -519,7 +687,6 @@
 
     $('breakdownModeTag').textContent = bd?.mode === 'exact_snapshot' ? 'SQLite 实测' : 'JSONL 概算';
 
-    // Build 100-cell matrix (1 cell = 1% of window)
     const cells = [];
     for (const c of cats) {
       const pct = limit > 0 ? (c.tokens / limit) * 100 : 0;
@@ -536,7 +703,7 @@
     while (cells.length < 100) {
       cells.push({
         color: 'var(--v-secondary)',
-        label: `剩余可用空间: ${fmtNum(freeTokens)} (${(100 - usedCells)}%)`,
+        label: `剩余可用空间: ${fmtNum(freeTokens)} (${100 - usedCells}%)`,
       });
     }
 
@@ -559,7 +726,6 @@
       });
     });
 
-    // Category rows
     $('categoryRows').innerHTML = cats
       .map((c) => {
         const pct = limit > 0 ? (c.tokens / limit) * 100 : 0;
@@ -583,7 +749,6 @@
       })
       .join('');
 
-    // Warm vs Cold TTFT Comparison
     $('warmCountLabel').textContent = `(${s.warmCount})`;
     $('coldCountLabel').textContent = `(${s.coldCount})`;
     $('warmTtftVal').textContent = fmtSec(s.avgWarmTtft);
@@ -684,7 +849,7 @@
     render();
   });
 
-  // ---------- Polling Loop ----------
+  // ---------- Polling Loop + 100ms Live Ticker ----------
   async function poll() {
     let delay = IDLE_POLL_MS;
     try {
@@ -706,6 +871,10 @@
       state.lastOk = Date.now();
       state.stale = false;
 
+      if (res.serverNowMs) {
+        state.clockOffsetMs = res.serverNowMs - Date.now();
+      }
+
       if (!res.unchanged) {
         state.etag = res.etag || '';
         state.data = res;
@@ -718,12 +887,12 @@
       }
 
       const act = state.data?.activity;
-      if (!state.data?.hasData) delay = EMPTY_POLL_MS;
-      else if (act === 'streaming' || act === 'tool_running') delay = ACTIVE_POLL_MS;
+      if (!state.data?.hasData && !isActiveState(act)) delay = EMPTY_POLL_MS;
+      else if (isActiveState(act)) delay = ACTIVE_POLL_MS;
       else delay = IDLE_POLL_MS;
     } catch (err) {
       console.warn('[vitals] poll failed:', err);
-      state.stale = Date.now() - state.lastOk > IDLE_POLL_MS * 3;
+      state.stale = Date.now() - state.lastOk > IDLE_POLL_MS * 4;
       render();
       delay = EMPTY_POLL_MS;
     } finally {
@@ -731,6 +900,7 @@
     }
   }
 
+  setInterval(updateLiveClocks, LIVE_TICK_MS);
   render();
   poll();
 })();

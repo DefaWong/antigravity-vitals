@@ -611,6 +611,10 @@ button:focus-visible {
   gap: 8px;
 }
 
+.strip-card.is-live {
+  border-color: color-mix(in srgb, var(--v-primary) 55%, var(--v-card-border));
+}
+
 .strip-left {
   display: flex;
   align-items: center;
@@ -627,6 +631,107 @@ button:focus-visible {
 
 .link-btn:hover {
   text-decoration: underline;
+}
+
+/* Tool Hotspots Card */
+.active-tools {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.active-tool-pill {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  border: 1px solid color-mix(in srgb, var(--v-primary) 45%, var(--v-card-border));
+  background: color-mix(in srgb, var(--v-primary) 8%, var(--v-bg));
+  font-size: 11.5px;
+}
+
+.active-tool-left {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.tools-list {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.tool-row {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.tool-row-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11.5px;
+}
+
+.tool-name-wrap {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.tool-name {
+  color: var(--v-fg);
+  font-weight: 500;
+}
+
+.tool-err-pill {
+  padding: 0 4px;
+  border-radius: 4px;
+  font-size: 10px;
+  line-height: 15px;
+  border: 1px solid var(--v-error);
+  color: var(--v-error);
+  flex: none;
+}
+
+.tool-metrics {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+  color: var(--v-muted);
+}
+
+.tool-bar-track {
+  height: 4px;
+  width: 100%;
+  border-radius: 999px;
+  background: var(--v-secondary);
+  overflow: hidden;
+}
+
+.tool-bar-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--v-chart-1);
+  transition: width 0.25s ease;
+}
+
+.tool-bar-fill.is-running {
+  background: var(--v-primary);
+}
+
+.tools-empty {
+  color: var(--v-muted);
+  font-size: 11.5px;
+  padding: 4px 0;
 }
 
 /* Turns Ledger */

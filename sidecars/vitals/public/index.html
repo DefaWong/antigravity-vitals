@@ -185,10 +185,20 @@
             <div id="svgChartWrap" class="chart-wrap"></div>
           </div>
 
+          <!-- Tool Hotspots & Live Tool Status Card (D) -->
+          <div class="card section-card" id="toolsCard">
+            <div class="card-head">
+              <span class="card-title">工具调用热点</span>
+              <span id="toolsSummary" class="mono muted">0 次</span>
+            </div>
+            <div id="activeToolsStrip" class="active-tools hidden"></div>
+            <div id="toolsList" class="tools-list"></div>
+          </div>
+
           <!-- Latest Turn Strip -->
-          <div class="card strip-card">
+          <div class="card strip-card" id="lastTurnCard">
             <div class="strip-left">
-              <span class="muted">最近调用</span>
+              <span id="lastTurnLabel" class="muted">最近调用</span>
               <span id="lastTurnMeta" class="mono strong truncate">--</span>
             </div>
             <button id="jumpTurnsBtn" type="button" class="link-btn">明细 →</button>
